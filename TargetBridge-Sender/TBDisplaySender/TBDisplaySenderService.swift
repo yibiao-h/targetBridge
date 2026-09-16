@@ -32,6 +32,9 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
     case retina4k60
     case native5k
     case native5k60Experimental
+    /// Lossless: 5120x2880 at 60, 4:4:4 10-bit, bit-exact. Never touches the
+    /// hardware encoder -- frames go out as TBD2, see TargetBridge-Shared/codec.
+    case native5kRaw60
 
     var id: String { rawValue }
 
@@ -55,6 +58,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return "5K"
         case .native5k60Experimental:
             return "5K 60 Experimental"
+        case .native5kRaw60:
+            return "5K DPCM"
         }
     }
 
@@ -78,6 +83,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return "5120 × 2880 @ 48"
         case .native5k60Experimental:
             return "5120 × 2880 @ 60"
+        case .native5kRaw60:
+            return "5120 × 2880 @ 60 · 4:4:4 10-bit · lossless DPCM"
         }
     }
 
@@ -93,7 +100,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 3840
         case .retina4k60:
             return 4096
-        case .native5k, .native5k60Experimental:
+        case .native5k, .native5k60Experimental, .native5kRaw60:
             return 5120
         }
     }
@@ -110,7 +117,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 2160
         case .retina4k60:
             return 2304
-        case .native5k, .native5k60Experimental:
+        case .native5k, .native5k60Experimental, .native5kRaw60:
             return 2880
         }
     }
@@ -135,6 +142,11 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 120_000_000
         case .native5k60Experimental:
             return 150_000_000
+        case .native5kRaw60:
+            // Unread: the lossless path never creates a VTCompressionSession. A
+            // real number keeps the switch exhaustive and nothing divides by zero
+            // if that ever changes.
+            return 120_000_000
         }
     }
 
@@ -144,6 +156,11 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return "H.264"
         case .crisp2160p60, .retina4k60, .native5k, .native5k60Experimental:
             return "HEVC"
+        case .native5kRaw60:
+            // Not "HEVC": this preset never reaches the hardware encoder, and the
+            // panel repeats this string. Naming the codec rather than the
+            // guarantee, the same way the other rows name theirs.
+            return "DPCM"
         }
     }
 
@@ -153,6 +170,21 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return kCMVideoCodecType_H264
         case .crisp2160p60, .retina4k60, .native5k, .native5k60Experimental:
             return kCMVideoCodecType_HEVC
+        case .native5kRaw60:
+            // Never reached: isRawPassthrough diverts before the encoder is
+            // consulted. Naming HEVC here would be a lie the panel could repeat.
+            return kCMVideoCodecType_HEVC
+        }
+    }
+
+    /// Whether this preset bypasses the hardware encoder entirely and ships
+    /// lossless TBD2 frames instead. Only one preset does.
+    var isRawPassthrough: Bool {
+        switch self {
+        case .native5kRaw60:
+            return true
+        default:
+            return false
         }
     }
 
@@ -169,6 +201,18 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             // high-frame-rate 4K capture while the serial pipeline prevents an
             // application-side frame backlog.
             return 5
+        case .native5kRaw60:
+            // 8 at 5K, which is also ScreenCaptureKit's own default. Both numbers
+            // are right at different resolutions and this is the boundary.
+            //
+            // Measured here: at 5K the capture callback runs 10-14 ms against a
+            // 16.7 ms period, so a shallow queue leaves ScreenCaptureKit nowhere
+            // to put the next frame -- and a stalled stream delivers NOTHING
+            // rather than a stale frame, which reads as "macOS did not draw it".
+            // The reasoning behind 5 above still holds at 4K and below, where the
+            // callback is short enough that a deep queue takes buffers rather
+            // than using them.
+            return 8
         }
     }
 
@@ -188,7 +232,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 60
         case .native5k:
             return 48
-        case .native5k60Experimental:
+        case .native5k60Experimental, .native5kRaw60:
             return 60
         }
     }
@@ -214,7 +258,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 60
         case .native5k:
             return 48
-        case .native5k60Experimental:
+        case .native5k60Experimental, .native5kRaw60:
             return 60
         }
     }
@@ -231,7 +275,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 1
         case .smooth1800p60, .crisp2160p60, .retina4k60:
             return 1
-        case .native5k, .native5k60Experimental:
+        case .native5k, .native5k60Experimental, .native5kRaw60:
             return 1
         }
     }
@@ -240,7 +284,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1080p, .standard1440p:
             return false
-        case .smooth1080p60, .smooth1440p60, .smooth1800p60, .crisp2160p60, .retina4k60, .native5k, .native5k60Experimental:
+        case .smooth1080p60, .smooth1440p60, .smooth1800p60, .crisp2160p60, .retina4k60, .native5k,
+             .native5k60Experimental, .native5kRaw60:
             return true
         }
     }
@@ -256,7 +301,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1080p, .standard1440p:
             return 1
-        case .smooth1080p60, .smooth1440p60, .smooth1800p60, .crisp2160p60, .retina4k60, .native5k, .native5k60Experimental:
+        case .smooth1080p60, .smooth1440p60, .smooth1800p60, .crisp2160p60, .retina4k60, .native5k,
+             .native5k60Experimental, .native5kRaw60:
             return 0
         }
     }
@@ -265,7 +311,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1080p, .standard1440p:
             return false
-        case .smooth1080p60, .smooth1440p60, .smooth1800p60, .crisp2160p60, .retina4k60, .native5k, .native5k60Experimental:
+        case .smooth1080p60, .smooth1440p60, .smooth1800p60, .crisp2160p60, .retina4k60, .native5k,
+             .native5k60Experimental, .native5kRaw60:
             return true
         }
     }
@@ -281,7 +328,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1080p, .smooth1080p60, .standard1440p, .smooth1440p60, .smooth1800p60:
             return .nominal
-        case .crisp2160p60, .retina4k60, .native5k, .native5k60Experimental:
+        case .crisp2160p60, .retina4k60, .native5k, .native5k60Experimental,
+             .native5kRaw60:
             return .best
         }
     }
@@ -298,7 +346,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 60
         case .native5k:
             return 48
-        case .native5k60Experimental:
+        case .native5k60Experimental, .native5kRaw60:
             return 60
         }
     }
@@ -570,6 +618,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
          displayName: String,
          displayID: CGDirectDisplayID,
          usesRawNV12: Bool,
+         dpcmEnabled: Bool,
          ackAlreadySent: Bool,
          onFirstFrame: @escaping @Sendable () -> Void) {
         self.preset = preset
@@ -578,6 +627,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         self.displayName = displayName
         self.displayID = displayID
         self.usesRawNV12 = usesRawNV12
+        self.dpcmEnabled = dpcmEnabled
         self.frameRatePacer = TBFrameRatePacer(maximumFrameRate: preset.expectedFrameRate)
         self.ackSent = ackAlreadySent
         self.onFirstFrame = onFirstFrame
@@ -589,7 +639,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// could not be created.
     func start() -> Bool {
         queue.sync {
-            if usesRawNV12 {
+            if usesRawNV12 || preset.isRawPassthrough {
+                // Neither path creates a VTCompressionSession, so neither can be
+                // blocked by the hardware encoder being unavailable.
                 running = true
                 return true
             }
@@ -729,6 +781,12 @@ private final class TBVideoPipeline: @unchecked Sendable {
             droppedByFrameRatePacer += 1
             return
         }
+        if preset.isRawPassthrough {
+            // Lossless path: no VTCompressionSession is ever created for this
+            // preset, so there is nothing below to fall through to.
+            sendDPCMFrame(sampleBuffer)
+            return
+        }
         if usesRawNV12 {
             sendRawFrame(sampleBuffer)
             return
@@ -857,6 +915,84 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// and send them uncompressed. The receiver blits them directly (no decode).
     /// Payload: [1: format=1(NV12)][BE32 w][BE32 h][BE32 yStride][BE32 uvStride]
     ///          [Y plane: yStride*h][CbCr plane: uvStride*(h/2)]
+    /// Whether the peer advertised a working TBD2 decoder. Set from the display
+    /// profile; false for an older receiver, which keeps getting NV12.
+    var dpcmEnabled = false
+    private var dpcmGPU: OpaquePointer?
+    private var dpcmGPUTried = false
+
+    /// Compress the frame losslessly and send it as one TB_PKT_RAW_DPCM packet.
+    ///
+    /// Falls back to the uncompressed path whenever the lossless one is not
+    /// available -- an old receiver, or a GPU encoder that could not be created.
+    /// The fallback is a real picture, just a larger one on the wire.
+    private func sendDPCMFrame(_ sampleBuffer: CMSampleBuffer) {
+        guard running,
+              let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
+        else { return }
+        guard dpcmEnabled else {
+            sendRawFrame(sampleBuffer)
+            return
+        }
+        if pendingVideoPackets >= preset.maxPendingVideoPackets {
+            droppedBeforeEncodeFrames += 1
+            return
+        }
+        if !dpcmGPUTried {
+            dpcmGPUTried = true
+            dpcmGPU = tb_dpcm_gpu_create()
+            if dpcmGPU == nil {
+                TBLog.connection.error("dpcm: GPU encoder unavailable; sending uncompressed")
+            }
+        }
+        guard let encoder = dpcmGPU else {
+            sendRawFrame(sampleBuffer)
+            return
+        }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        // ARGB2101010 is the 10-bit 4:4:4 format this preset captures in; BGRA is
+        // the 8-bit one. Both are packed and single-plane, so unlike the NV12 path
+        // above there is no plane count to check.
+        let tenBit = CVPixelBufferGetPixelFormatType(pixelBuffer)
+            == kCVPixelFormatType_ARGB2101010LEPacked
+
+        // header_reserve is 0 here: makePacket copies the payload anyway, so
+        // reserving room for the header in the encoder's buffer would not save the
+        // copy. A sender that writes the packet in place should pass the header
+        // size instead and build it into the reserved run -- the encoder supports
+        // that, and on a ~30 MB frame the second copy measured ~3 ms.
+        var blob: UnsafePointer<UInt8>? = nil
+        let produced = tb_dpcm_gpu_encode(encoder,
+                                          base.assumingMemoryBound(to: UInt8.self),
+                                          Int32(stride), Int32(width), Int32(height),
+                                          tenBit ? 1 : 0,
+                                          0,
+                                          &blob)
+        guard produced > 0, let blob else {
+            // A failed encode is not a reason to drop the frame -- the
+            // uncompressed path is always available and always correct.
+            sendRawFrame(sampleBuffer)
+            return
+        }
+        let packet = TBMonitorProtocol.makePacket(
+            type: .rawDPCM, payload: Data(bytes: blob, count: produced))
+        pendingVideoPackets += 1
+        connection.send(content: packet, completion: .contentProcessed({ [weak self] _ in
+            guard let self else { return }
+            self.queue.async {
+                self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
+            }
+        }))
+        lock.lock(); _sentFrames += 1; lock.unlock()
+    }
+
     private func sendRawFrame(_ sampleBuffer: CMSampleBuffer) {
         guard running,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
@@ -1222,6 +1358,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// Set while adopting state the receiver reported, so the didSet observers
     /// above don't echo it back and start a loop.
     private var adoptingReportedTweaks = false
+    /// Receiver advertised a working TBD2 decoder. Drives whether frames go out
+    /// losslessly or as NV12; false for an older receiver.
+    @Published var receiverSupportsDPCM = false
     @Published var receiverSupportsNightShift = false
     @Published var receiverSupportsTrueTone = false
     var audioAddonAvailable = true
@@ -2782,6 +2921,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 displayName: session.displayName,
                 displayID: session.displayID,
                 usesRawNV12: usesRawNV12,
+                dpcmEnabled: receiverSupportsDPCM,
                 ackAlreadySent: sessionAckSent,
                 onFirstFrame: { [weak self] in
                     Task { @MainActor in self?.handleFirstEncodedFrame() }
