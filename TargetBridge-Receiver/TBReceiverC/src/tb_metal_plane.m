@@ -87,34 +87,12 @@ static double tb_mp_now_ms(void) {
  * remove that synchronous present path, not to starve the pool. */
 #define TB_METAL_RING 3
 
-/* Upload staging slots.
- *
- * Sized for SLICES, not frames. This was 3, from when a frame was a single
- * upload — but a sliced frame takes one slot per band, so at 18 bands the
- * thread doing the uploading blocked on slot recycling eighteen times a frame.
- * That thread also services the window and the socket, so the receiver stopped
- * responding while the GPU caught up: not a deadlock, just the main thread used
- * as the throttle.
- *
- * A slice slot is a fraction of a frame (~1.7 MB at 18 bands against ~30 MB
- * whole), so depth is cheap where it used to be expensive. */
-/* Eight, not thirty-two. Sized for bands at ~1.7 MB, thirty-two forgot that the
- * same ring carries WHOLE frames on the unsliced path, and every slot grows to
- * the largest request it has ever seen: 32 x ~30 MB is a gigabyte of staging
- * buffers. Measured 4.4 GB peak footprint on the receiver, which put the machine
- * into swap and stalled the stream to zero with none of the drop paths firing —
- * nothing was broken, it was just thrashing.
- *
- * Eight is comfortably above the 4-band working set and bounds the ring at
- * ~240 MB in the worst case. */
-#define TB_UPLOAD_RING 8
-
-/* Frames in flight. One surface is not enough once a frame arrives as bands:
- * the next frame's first band starts decoding while the current frame is still
- * being presented, and with a single buffer the screen shows bands from two
- * frames at once. Three is what the source spec called for and what the cost
- * justifies — 59 MB each against 4 GB of VRAM. */
+/* The current transport sends whole frames and waits for each decode before
+ * presenting. Keep at most three presentation surfaces and one additional
+ * decode/upload slot; the former eight-slot ring was sized for sliced frames
+ * and retained eight full-frame buffers even though that wire path is unused. */
 #define TB_FRAME_RING 3
+#define TB_UPLOAD_RING (TB_FRAME_RING + 1)
 
 /* Mirrors DpcmParams in the shader. */
 struct tb_dpcm_gpu_params {
@@ -163,27 +141,6 @@ static struct {
     int                   frame_open;      /* a frame holds a ring slot */
     dispatch_semaphore_t  frames_free;
 
-    /* Present without blocking the render thread — TB_ASYNC_PRESENT=1.
-     *
-     * Presenting has to wait for every band's decode, and the simple way to do
-     * that is to block on the last one, which is what the synchronous path
-     * does. It costs the render thread roughly 4 ms a frame sitting idle, and
-     * during that time it cannot start on the next frame's early bands.
-     *
-     * Waiting is unavoidable; doing it on the render thread is not. Each band
-     * counts itself in before commit and out on completion, and whoever takes
-     * the count to zero performs the present. That needs no assumption about
-     * completion order — which matters, because the two claims in this file
-     * disagree about whether one queue guarantees it, and the comment written
-     * after the N>1 glitches says it does not. Counting is true either way.
-     *
-     * Off by default: this is the code that has glitched before. */
-    int                   async_present;
-    dispatch_queue_t      presentQ;
-    _Atomic int           bands_inflight;  /* committed, not yet completed */
-    int                   present_armed;   /* guarded by g_present_lock */
-    int                   present_idx;
-    int                   present_ten_bit;
     size_t                frame_bpr;
     int                   frame_w, frame_h;
 
@@ -201,25 +158,14 @@ static struct {
     int                   cur_img_w, cur_img_h, cur_img_hot_x, cur_img_hot_y;
     int                   cursor_layer_flipped;
     float                 cur_tex_scale;      /* what curTex was built for */
-    int                   cur_x, cur_y, cur_sw, cur_sh, cur_visible, cur_type;
+    int                   cur_x, cur_y, cur_sw, cur_sh, cur_visible, cur_type, cur_large;
+    float                 cur_hot_x, cur_hot_y;
 
     int                   shown;
     /* Default on: tearing should be opted into, never inherited. */
     int                   vsync;
     int                   vsync_initialised;
 } g;
-
-/* Guards g.present_idx / present_ten_bit / present_armed.
- *
- * File scope with a static initialiser on purpose: `g` is zero-initialised, and
- * an all-zero pthread_mutex_t is not a valid mutex on macOS — the initialiser
- * carries a signature. Keeping it out of the struct also means no ordering
- * question about when it becomes usable.
- *
- * A mutex rather than serialising on presentQ, because presentQ blocks inside
- * nextDrawable waiting for a vblank and the arming thread must never wait for
- * that. See the arming site for what it cost. */
-static pthread_mutex_t g_present_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void tb_metal_plane_set_vsync(int enabled) {
     const int want = enabled ? 1 : 0;
@@ -231,42 +177,32 @@ void tb_metal_plane_set_vsync(int enabled) {
     fprintf(stderr, "[metal] vsync %s\n", want ? "on" : "off (lower latency, may tear)");
 }
 
-/* Set by set_cursor, cleared by the cursor thread. */
+/* Set by set_cursor, cleared when the main loop updates the layer. */
 static atomic_int g_cursor_dirty = 0;
 
 static void tb_cursor_layer_attach(void);
 static void tb_cursor_layer_ensure(void);
 static void tb_cursor_layer_place(void);
 
-/* The cursor's own thread.
- *
- * WHY IT HAS ONE
- *
- * Placement used to run on the receiver's main loop. That loop blocks for up to
- * 100ms in dispatch_semaphore_wait(g.inflight) when the GPU is backed up — and
- * when presentQ is sitting in nextDrawable waiting for a vblank, inflight is
- * exactly what stops being signalled. Measured: `submit 100%`, `drawable 11.6ms`
- * and cursor latency going from 1.6ms to 23.9ms mean / 95ms worst, all in the
- * same five-second window. The cursor was never the faulty part; it was starved
- * by render backpressure, which is why three fixes aimed at the cursor missed.
- *
- * Only PROPERTY writes happen here — position, size, hidden — inside an explicit
- * CATransaction, which is what Core Animation supports off the main thread. The
- * structural work (creating the layer, re-parenting it, building its image) stays
- * on the main thread via tb_metal_plane_flush_cursor, because mutating a layer
- * TREE off-main while AppKit may also be touching it is a different and much
- * worse risk. */
-static pthread_t      g_cursor_thread;
-static atomic_int     g_cursor_thread_run = 0;
 static pthread_mutex_t g_cursor_state_lock = PTHREAD_MUTEX_INITIALIZER;
-/* Written by the packet thread, read by the cursor thread. Snapshotted together
- * so a placement can never mix a new x with an old y. */
+/* Snapshot a complete cursor position for placement. */
 static struct { int x, y, sw, sh, visible; double arrival_ms; } g_cur_pending;
 
 
 void tb_metal_plane_set_cursor(int x, int y, int source_w, int source_h,
-                               int visible, int type) {
+                               int visible, int type, int large) {
+    /* Keep the render-pass fallback in sync when the separate cursor layer is
+     * disabled with TB_CURSOR_PLANE=0. */
+    g.cur_x = x;
+    g.cur_y = y;
+    g.cur_sw = source_w > 0 ? source_w : 1;
+    g.cur_sh = source_h > 0 ? source_h : 1;
+    g.cur_visible = visible;
+    if (g.cur_type != type || g.cur_large != (large != 0)) {
+        g.cur_tex_scale = g.cur_layer_scale = -1.f;
+    }
     g.cur_type = type;
+    g.cur_large = large != 0;
 
     pthread_mutex_lock(&g_cursor_state_lock);
     g_cur_pending.x       = x;
@@ -293,74 +229,65 @@ void tb_metal_plane_set_cursor(int x, int y, int source_w, int source_h,
 
 /* ------------------------------------------------------------- cursor sprite */
 
-/* Even-odd scanline fill; the arrow is non-convex so a simple span fill will
- * not do. Coordinates are floats in sprite space. */
-static void tb_fill_poly(uint32_t *px, int w, int h, int stride,
-                         const float *xs, const float *ys, int n,
-                         uint32_t colour) {
-    float miny = ys[0], maxy = ys[0];
-    for (int i = 1; i < n; ++i) { if (ys[i] < miny) miny = ys[i]; if (ys[i] > maxy) maxy = ys[i]; }
-    int y0 = (int)miny; if (y0 < 0) y0 = 0;
-    int y1 = (int)maxy + 1; if (y1 > h) y1 = h;
-
-    for (int y = y0; y < y1; ++y) {
-        float cy = (float)y + 0.5f;
-        float xi[16];
-        int   cnt = 0;
-        for (int i = 0, j = n - 1; i < n && cnt < 16; j = i++) {
-            if ((ys[i] > cy) != (ys[j] > cy)) {
-                float t = (cy - ys[i]) / (ys[j] - ys[i]);
-                xi[cnt++] = xs[i] + t * (xs[j] - xs[i]);
+/* Match the existing cursor type values sent by TBDisplaySender. */
+static NSCursor *tb_cursor_for_type(int type) {
+    switch (type) {
+        case 1: return NSCursor.IBeamCursor;
+        case 2: return NSCursor.pointingHandCursor;
+        case 3: return NSCursor.resizeLeftRightCursor;
+        case 4: return NSCursor.resizeUpDownCursor;
+        case 5: return NSCursor.openHandCursor;
+        case 6: return NSCursor.crosshairCursor;
+        case 7:
+        case 8:
+            if (@available(macOS 15.0, *)) {
+                return [NSCursor frameResizeCursorFromPosition:
+                    type == 7 ? NSCursorFrameResizePositionTopLeft : NSCursorFrameResizePositionTopRight
+                    inDirections:NSCursorFrameResizeDirectionsAll];
+            } else {
+                /* The sender uses these same selectors on older macOS. */
+                SEL selector = NSSelectorFromString(type == 7
+                    ? @"_windowResizeNorthWestSouthEastCursor"
+                    : @"_windowResizeNorthEastSouthWestCursor");
+                if ([NSCursor respondsToSelector:selector]) {
+                    NSCursor *(*get_cursor)(id, SEL) = (void *)[NSCursor methodForSelector:selector];
+                    NSCursor *cursor = get_cursor(NSCursor.class, selector);
+                    if (cursor) return cursor;
+                }
+                return NSCursor.crosshairCursor;
             }
-        }
-        for (int a = 0; a < cnt - 1; ++a)          /* insertion sort, tiny n */
-            for (int b = a + 1; b < cnt; ++b)
-                if (xi[b] < xi[a]) { float t = xi[a]; xi[a] = xi[b]; xi[b] = t; }
-        for (int s = 0; s + 1 < cnt; s += 2) {
-            int xa = (int)xi[s], xb = (int)xi[s + 1];
-            if (xa < 0) xa = 0;
-            if (xb > w) xb = w;
-            uint32_t *row = px + (size_t)y * stride;
-            for (int x = xa; x < xb; ++x) row[x] = colour;
-        }
+        default: return NSCursor.arrowCursor;
     }
 }
 
-/* The arrow, in units later multiplied by `scale`. */
-static const float kArrowX[7] = { 0.f, 0.f,  4.5f, 7.5f, 10.5f, 7.5f, 12.f };
-static const float kArrowY[7] = { 0.f, 17.f, 13.f, 20.f, 19.f,  12.f, 12.f };
-#define TB_CUR_PAD 2   /* the black outline reaches this far from the shape */
+static float tb_cursor_scale(void) {
+    const int size = g.cur_large ? (g.frame_w >= 5000 ? 58 : 44)
+                                 : (g.frame_w >= 5000 ? 32 : 24);
+    return (float)size / 24.f;
+}
 
-/* Build the cursor into a small texture, once per scale. Drawn black-offset-then
- * white so it stays legible on any background — the same reason the SDL path
- * outlines it. Alpha is zero everywhere the arrow is not, so the render pass can
- * blend it over the video without touching the frame. */
-/* Rasterise the arrow into a fresh BGRA buffer. Shared by the Metal texture and
- * the CALayer overlay so the two can never draw a different cursor. Caller
- * frees. */
+/* Both presentation paths use the same premultiplied BGRA raster and hotspot.
+ * NSCursor supplies the shape and its hotspot; large scales both together. */
 static uint32_t *tb_cursor_raster(float scale, int *out_w, int *out_h) {
-    const int w = (int)(12.f * scale) + 2 * TB_CUR_PAD + 2;
-    const int h = (int)(20.f * scale) + 2 * TB_CUR_PAD + 2;
+    NSCursor *cursor = tb_cursor_for_type(g.cur_type);
+    NSImage *image = cursor.image;
+    NSSize size = g.cursorImage ? NSMakeSize(g.cur_img_w, g.cur_img_h) : image.size;
+    NSPoint hot = g.cursorImage ? NSMakePoint(g.cur_img_hot_x, g.cur_img_hot_y) : cursor.hotSpot;
+    CGImageRef source = g.cursorImage ?: [image CGImageForProposedRect:NULL context:nil hints:nil];
+    if (!source || size.width <= 0 || size.height <= 0) return NULL;
+    const int w = (int)ceil(size.width * scale), h = (int)ceil(size.height * scale);
     uint32_t *px = calloc((size_t)w * h, 4);
     if (!px) return NULL;
-
-    float bx[7], by[7];
-    const int off[8][2] = {{-2,0},{2,0},{0,-2},{0,2},{-2,-2},{2,-2},{-2,2},{2,2}};
-    for (int k = 0; k < 8; ++k) {
-        for (int i = 0; i < 7; ++i) {
-            bx[i] = TB_CUR_PAD + kArrowX[i] * scale + (float)off[k][0];
-            by[i] = TB_CUR_PAD + kArrowY[i] * scale + (float)off[k][1];
-        }
-        tb_fill_poly(px, w, h, w, bx, by, 7, 0xFF000000u);
-    }
-    for (int i = 0; i < 7; ++i) {
-        bx[i] = TB_CUR_PAD + kArrowX[i] * scale;
-        by[i] = TB_CUR_PAD + kArrowY[i] * scale;
-    }
-    tb_fill_poly(px, w, h, w, bx, by, 7, 0xFFFFFFFFu);
-
-    *out_w = w;
-    *out_h = h;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(px, w, h, 8, (size_t)w * 4, cs,
+        kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+    CGColorSpaceRelease(cs);
+    if (!context) { free(px); return NULL; }
+    CGContextDrawImage(context, CGRectMake(0, 0, w, h), source);
+    CGContextRelease(context);
+    g.cur_hot_x = (float)(hot.x * w / size.width);
+    g.cur_hot_y = (float)(hot.y * h / size.height);
+    *out_w = w; *out_h = h;
     return px;
 }
 
@@ -377,7 +304,7 @@ static void tb_cursor_build(float scale) {
                                                          height:(NSUInteger)h
                                                       mipmapped:NO];
     td.usage = MTLTextureUsageShaderRead;
-    td.storageMode = MTLStorageModeManaged;
+    td.storageMode = g.dev.hasUnifiedMemory ? MTLStorageModeShared : MTLStorageModeManaged;
     g.curTex = [g.dev newTextureWithDescriptor:td];
     if (g.curTex) {
         [g.curTex replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)w, (NSUInteger)h)
@@ -418,43 +345,11 @@ static void tb_cursor_build(float scale) {
  * own action dictionary AND per update, is deliberate belt-and-braces.
  */
 
-/* The cursor's placement loop. Wakes often enough to keep up with a 120 Hz
- * sender and does nothing at all when no position has arrived. */
-static void *tb_cursor_thread_main(void *unused) {
-    (void)unused;
-    pthread_setname_np("tb.cursor");
-    while (atomic_load(&g_cursor_thread_run)) {
-        if (atomic_exchange(&g_cursor_dirty, 0)) {
-            @autoreleasepool { tb_cursor_layer_place(); }
-        }
-        /* ~240 Hz: half the sender's sample interval, so a position never waits
-         * for a whole one. Idle cost is a sleep and an atomic load. */
-        usleep(4000);
-    }
-    return NULL;
-}
-
-/* Called from the receiver's main loop. Structural work ONLY — the loop can block
- * for up to 100ms on GPU backpressure, and that is precisely why placement no
- * longer happens here. */
+/* Cursor placement follows the receiver's main loop. There is no detached
+ * worker that could still touch a layer while a fallback tears it down. */
 void tb_metal_plane_flush_cursor(void) {
     tb_cursor_layer_ensure();
-
-    if (!atomic_load(&g_cursor_thread_run) && g.cursorLayer) {
-        atomic_store(&g_cursor_thread_run, 1);
-        if (pthread_create(&g_cursor_thread, NULL, tb_cursor_thread_main, NULL) != 0) {
-            atomic_store(&g_cursor_thread_run, 0);
-            fprintf(stderr, "[cursor] no thread; placing on the main loop instead\n");
-        } else {
-            pthread_detach(g_cursor_thread);
-            fprintf(stderr, "[cursor] placement moved to its own thread\n");
-        }
-    }
-
-    /* Fallback: without a thread, keep the old behaviour rather than freezing. */
-    if (!atomic_load(&g_cursor_thread_run) && atomic_exchange(&g_cursor_dirty, 0)) {
-        tb_cursor_layer_place();
-    }
+    if (atomic_exchange(&g_cursor_dirty, 0)) tb_cursor_layer_place();
 }
 
 void tb_metal_plane_note_cursor_arrival(double recv_ms) {
@@ -490,16 +385,14 @@ void tb_metal_plane_set_cursor_image(const uint8_t *rgba, int w, int h,
         /* Force the next placement to recompute size from the new bitmap. */
         g.cur_layer_w = w;
         g.cur_layer_h = h;
-        g.cur_layer_scale = -1.f;
-        tb_cursor_layer_place();
+        g.cur_layer_scale = g.cur_tex_scale = -1.f;
+        tb_metal_plane_flush_cursor();
     }
     if (ctx) CGContextRelease(ctx);
     CGColorSpaceRelease(cs);
 }
 
 static void tb_cursor_layer_sync_image(float scale) {
-    /* A real cursor bitmap from the sender always wins over the drawn arrow. */
-    if (g.cursorImage) return;
     if (!g.cursorLayer || g.cur_layer_scale == scale) return;
 
     int w = 0, h = 0;
@@ -572,7 +465,7 @@ static void tb_cursor_layer_ensure(void) {
     /* The sprite is built here too: it allocates and makes a CGImage, which has
      * no business happening on the hot path. */
     if (g.cursorLayer && g.frame_w > 0) {
-        tb_cursor_layer_sync_image(((g.frame_w >= 5000) ? 58.f : 44.f) / 24.f);
+        tb_cursor_layer_sync_image(tb_cursor_scale());
     }
 }
 
@@ -609,10 +502,9 @@ static void tb_cursor_layer_place(void) {
     /* Cursor arrives in the sender's source-frame space; express everything as a
      * fraction of the frame, then multiply by the layer's size in points. That
      * keeps it correct whatever the window size is. */
-    /* The drawn arrow is offset by its padding; a real bitmap is offset by its
-     * own hot spot, which is the pixel the user is actually pointing with. */
-    const double offx = g.cursorImage ? (double)g.cur_img_hot_x : (double)TB_CUR_PAD;
-    const double offy = g.cursorImage ? (double)g.cur_img_hot_y : (double)TB_CUR_PAD;
+    /* Both the layer and render-pass path use the same scaled image hotspot. */
+    const double offx = g.cur_hot_x;
+    const double offy = g.cur_hot_y;
     const double fx = ((double)cx / (double)csw)
                     - (offx / (double)g.frame_w);
     const double fy = ((double)cy / (double)csh)
@@ -698,9 +590,6 @@ static void tb_cursor_layer_attach(void) {
 }
 
 static void tb_cursor_layer_detach(void) {
-    /* Stop the placement thread before the layer goes, so it cannot touch a
-     * released layer. Detached, so a short wait is enough for it to notice. */
-    if (atomic_exchange(&g_cursor_thread_run, 0)) usleep(12000);
     if (!g.cursorLayer) return;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
@@ -763,7 +652,7 @@ static NSString *tb_shader_source(void) {
     "  float2 c = float2((vid == 1 || vid == 2 || vid == 4) ? r.z : r.x,\n"
     "                    (vid == 2 || vid == 4 || vid == 5) ? r.w : r.y);\n"
     "  float2 uv = float2((c.x - r.x) / (r.z - r.x), (c.y - r.y) / (r.w - r.y));\n"
-    "  VOut o; o.pos = float4(c, 0, 1); o.uv = float2(uv.x, 1.0 - uv.y);\n"
+    "  VOut o; o.pos = float4(c, 0, 1); o.uv = uv;\n"
     "  return o;\n"
     "}\n"
     "fragment float4 tb_cursor_fs(VOut in [[stage_in]],\n"
@@ -919,16 +808,20 @@ int tb_metal_plane_init(SDL_Window *win) {
     }
 
     g.layer = (__bridge CAMetalLayer *)SDL_Metal_GetLayer(g.view);
-    if (!g.layer) { fprintf(stderr, "[metal] no CAMetalLayer\n"); return -1; }
+    if (!g.layer) {
+        fprintf(stderr, "[metal] no CAMetalLayer\n");
+        tb_metal_plane_shutdown();
+        return -1;
+    }
 
+    g.layer.hidden = YES;
+    [(__bridge NSView *)g.view setHidden:YES];
     g.layer.device = g.dev;
     g.layer.pixelFormat = MTLPixelFormatBGR10A2Unorm;
     g.layer.framebufferOnly = NO;
     g.layer.opaque = YES;
     g.layer.maximumDrawableCount = TB_METAL_RING;
     g.layer.displaySyncEnabled = g.vsync ? YES : NO;
-    tb_cursor_layer_attach();
-    tb_cursor_layer_place();
     /* Tag the layer with the space the pixels are actually in, which is what
      * the sender captures: Display P3.
      *
@@ -971,6 +864,7 @@ int tb_metal_plane_init(SDL_Window *win) {
     if (!lib) {
         fprintf(stderr, "[metal] shader compile failed: %s\n",
                 err.localizedDescription.UTF8String ?: "?");
+        tb_metal_plane_shutdown();
         return -1;
     }
 
@@ -982,6 +876,7 @@ int tb_metal_plane_init(SDL_Window *win) {
     if (!g.pipe) {
         fprintf(stderr, "[metal] pipeline failed: %s\n",
                 err.localizedDescription.UTF8String ?: "?");
+        tb_metal_plane_shutdown();
         return -1;
     }
 
@@ -990,7 +885,7 @@ int tb_metal_plane_init(SDL_Window *win) {
     cd.fragmentFunction = [lib newFunctionWithName:@"tb_cursor_fs"];
     cd.colorAttachments[0].pixelFormat = MTLPixelFormatBGR10A2Unorm;
     cd.colorAttachments[0].blendingEnabled = YES;
-    cd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+    cd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
     cd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
     cd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
     cd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
@@ -1023,34 +918,17 @@ int tb_metal_plane_init(SDL_Window *win) {
     if (g.row_align == 0) g.row_align = 256;
 
     g.queue = [g.dev newCommandQueue];
+    if (!g.queue) { tb_metal_plane_shutdown(); return -1; }
     g.inflight = dispatch_semaphore_create(TB_UPLOAD_RING);
-    {
-        /* On by default since 2026-08-07. Shipped opt-in first because this is
-         * the code that glitched at every slice count above one, and that
-         * failure was content-dependent — it needed real use to trust, not a
-         * clean minute. It got that: sustained video, scrolling and window
-         * dragging with no artefact, `submit` down from 24% to 15% of wall
-         * time, and every frame counter clean throughout.
-         *
-         * TB_ASYNC_PRESENT=0 falls back, because the failure mode here is
-         * visible-only — no counter we have goes red when it happens — so the
-         * escape hatch is for eyes, not for logs. */
-        const char *ap = getenv("TB_ASYNC_PRESENT");
-        g.async_present = !(ap && ap[0] == '0');
-        if (g.async_present) {
-            g.presentQ = dispatch_queue_create("tb.present", DISPATCH_QUEUE_SERIAL);
-            if (!g.presentQ) g.async_present = 0;
-        }
-        fprintf(stderr, "[metal] present %s\n",
-                g.async_present ? "async (TB_ASYNC_PRESENT=0 reverts)"
-                                : "synchronous");
-    }
+    /* This protocol sends complete frames. Present synchronously so each frame
+     * owns its surface until submission; a shared async "latest frame" slot
+     * loses ownership when another decode completes before presentation. */
     g.frames_free = dispatch_semaphore_create(TB_FRAME_RING);
     g.frame_widx = 0;
     g.frame_open = 0;
     g.ring_idx = 0;
     g.ready = 1;
-    g.shown = 1;
+    g.shown = 0;
 
     fprintf(stderr, "[metal] plane ready on %s (dpcm=%s)\n",
             [[g.dev name] UTF8String], g.dpcmPipe ? "yes" : "no");
@@ -1058,7 +936,7 @@ int tb_metal_plane_init(SDL_Window *win) {
 }
 
 void tb_metal_plane_shutdown(void) {
-    if (!g.ready) return;
+    if (!g.ready && !g.view && !g.dev) return;
     g.shown = 0;
     g.frame_w = g.frame_h = 0;
 
@@ -1163,17 +1041,36 @@ int tb_metal_plane_supports_dpcm(void) {
 }
 
 void tb_metal_plane_set_hidden(int hidden) {
-    if (!hidden) return;
+    if (!hidden) {
+        if (g.ready && !g.shown) {
+            g.layer.hidden = NO;
+            [(__bridge NSView *)g.view setHidden:NO];
+            g.shown = 1;
+            tb_cursor_layer_attach();
+        }
+        return;
+    }
     /* Fully remove the view: hiding the layer is not enough to reveal the
      * OpenGL content underneath. Only fires on an actual transition. */
-    if (g.ready && g.shown) {
-        g.shown = 0;
+    if (g.ready) {
         tb_metal_plane_shutdown();
         fprintf(stderr, "[metal] plane released; SDL owns the window\n");
     }
 }
 
 /* ---------------------------------------------------------------- geometry */
+
+/* The transport currently offers at most 5K. The generic codec accepts larger
+ * images, but a small flat blob must not allocate multi-gigabyte GPU rings. */
+static int tb_metal_frame_dimensions_valid(int w, int h) {
+    return w > 0 && h > 0 && w <= 5120 && h <= 2880;
+}
+
+int tb_metal_plane_accepts_dpcm(const uint8_t *blob, size_t len) {
+    struct tb_dpcm_info info;
+    return tb_dpcm_parse(blob, len, &info) == 0 &&
+           tb_metal_frame_dimensions_valid(info.width, info.height);
+}
 
 /* Drive the layer at the frame's own resolution and let Core Animation scale it
  * to the window. On this 5K panel fullscreen they match, so scaling is free;
@@ -1225,6 +1122,7 @@ static id<MTLBuffer> tb_upload_take(size_t bytes) {
  * bytes in place. */
 static int tb_present(id<MTLCommandBuffer> cb, id<MTLBuffer> src,
                       MTLStorageMode mode, int ten_bit) {
+    if (!cb) { dispatch_semaphore_signal(g.inflight); return -1; }
     /* Timed because this is where vsync actually costs us: with
      * displaySyncEnabled the call blocks until a drawable frees. The mean tells
      * us whether maximumDrawableCount is worth lowering, or whether doing so
@@ -1245,22 +1143,10 @@ static int tb_present(id<MTLCommandBuffer> cb, id<MTLBuffer> src,
     id<MTLTexture> srcTex = [src newTextureWithDescriptor:td offset:0
                                              bytesPerRow:g.frame_bpr];
     if (!srcTex) {
-        /* PRESENT THE DRAWABLE EVEN THOUGH THERE IS NOTHING TO DRAW.
-         *
-         * A CAMetalLayer reclaims a drawable only when it is presented. Bailing
-         * out here after nextDrawable had already handed us one burned it
-         * permanently: three failures and the pool of three was gone, so the next
-         * nextDrawable blocked forever and the receiver stopped advancing frames
-         * while still looking healthy — the "bogging down" that toggling vsync
-         * cleared, because reassigning displaySyncEnabled reconfigures the layer
-         * and rebuilds the pool.
-         *
-         * Presenting an undrawn drawable shows one stale or blank frame, which is
-         * a far better failure than a permanently wedged pipeline. */
-        [cb presentDrawable:drawable];
-        [cb commit];
+        /* No commands were submitted: the caller releases its frame slot.
+         * ARC releases this drawable back to the pool when we return. */
         dispatch_semaphore_signal(g.inflight);
-        fprintf(stderr, "[metal] no source texture; drawable returned to the pool\n");
+        fprintf(stderr, "[metal] no source texture\n");
         return -1;
     }
 
@@ -1269,27 +1155,12 @@ static int tb_present(id<MTLCommandBuffer> cb, id<MTLBuffer> src,
     rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!enc) { dispatch_semaphore_signal(g.inflight); return -1; }
     [enc setRenderPipelineState:g.pipe];
     [enc setFragmentTexture:srcTex atIndex:0];
-    /* Dither 8-bit content only.
-     *
-     * At 8 bits the source sits on a coarser grid than the drawable, the steps
-     * are real, and spreading them is measurably better — an 8-bit ramp banded
-     * here while the same data was smooth in any ordinary window.
-     *
-     * At 10 bits there is nothing left to spread and this only adds noise. The
-     * amplitude is half an 8-bit step, which is a FULL least-significant bit at
-     * 10-bit (0.5/255 against 1/1023), so it was perturbing values the pipeline
-     * carries exactly.
-     *
-     * It ran unconditionally because the panel was believed to be 8-bit, read
-     * from NSBitsPerSampleFromDepth — a legacy window depth that reports 8 on
-     * essentially every Mac and says nothing about deep colour. This panel is
-     * 10-bit (8-bit native plus 2-bit FRC) and the whole chain carries 10:
-     * an HDR virtual display gives a 16-bpc framebuffer, capture is packed
-     * ARGB2101010, TBD2 is lossless, and the drawable is BGR10A2Unorm.
-     * Confirmed by eye — gradients look better with this off at 10 bits, which
-     * could only happen if the extra bits reach the panel. */
+    /* Eight-bit samples may be dithered into the deeper drawable. Do not add
+     * noise to ten-bit samples, whose low bits the codec already preserves.
+     * The drawable format alone does not establish the panel's output depth. */
     const float dither = ten_bit ? 0.0f : g.dither;
     [enc setFragmentBytes:&dither length:sizeof(dither) atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -1298,15 +1169,14 @@ static int tb_present(id<MTLCommandBuffer> cb, id<MTLBuffer> src,
      * With the plane attached this would be a second, staler arrow drawn on top
      * of the live one. */
     if (g.cur_visible && g.cursorPipe && !g.cursorLayer) {
-        const float scale = ((g.frame_w >= 5000) ? 58.f : 44.f) / 24.f;
-        tb_cursor_build(scale);
+        tb_cursor_build(tb_cursor_scale());
         if (g.curTex) {
             /* Cursor coordinates arrive in the sender's source-frame space, which
              * is not necessarily the frame we are showing. */
             const float sx = (float)g.frame_w / (float)g.cur_sw;
             const float sy = (float)g.frame_h / (float)g.cur_sh;
-            const float px = (float)g.cur_x * sx - (float)TB_CUR_PAD;
-            const float py = (float)g.cur_y * sy - (float)TB_CUR_PAD;
+            const float px = (float)g.cur_x * sx - g.cur_hot_x;
+            const float py = (float)g.cur_y * sy - g.cur_hot_y;
             /* Pixels to normalised device coordinates; y is flipped. */
             const float x0 =  (px / (float)g.frame_w) * 2.f - 1.f;
             const float x1 = ((px + (float)g.cur_tex_w) / (float)g.frame_w) * 2.f - 1.f;
@@ -1337,7 +1207,7 @@ static int tb_present(id<MTLCommandBuffer> cb, id<MTLBuffer> src,
 
 int tb_metal_plane_render_packed(const uint8_t *px, int stride, int w, int h,
                                  int ten_bit) {
-    if (!g.ready || !px || w <= 0 || h <= 0) return -1;
+    if (!g.ready || !px || !tb_metal_frame_dimensions_valid(w, h)) return -1;
 
     @autoreleasepool {
         tb_geometry_set(w, h);
@@ -1371,45 +1241,6 @@ static int tb_frame_ensure(void) {
     return g.frame[i] ? 0 : -1;
 }
 
-/* Runs on presentQ once every band of the armed frame has completed. Mirrors
- * the tail of the synchronous path exactly — same ring-slot bookkeeping, same
- * failure handling — just off the render thread. */
-static void tb_present_armed_frame(void) {
-    /* Take the arming state under the lock and RELEASE IT before presenting.
-     * Holding it across tb_present would put the render thread back to sleep on
-     * a vblank, which is the entire thing this lock exists to avoid. */
-    pthread_mutex_lock(&g_present_lock);
-    const int armed = g.present_armed;
-    const int idx   = g.present_idx;
-    const int ten   = g.present_ten_bit;
-    g.present_armed = 0;
-    pthread_mutex_unlock(&g_present_lock);
-
-    if (!armed) return;
-
-    dispatch_semaphore_t frames = g.frames_free;
-
-    @autoreleasepool {
-        id<MTLCommandBuffer> pcb = [g.queue commandBuffer];
-        [pcb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull done) {
-            (void)done;
-            dispatch_semaphore_signal(frames);
-        }];
-        if (dispatch_semaphore_wait(g.inflight,
-                                    dispatch_time(DISPATCH_TIME_NOW,
-                                                  100 * NSEC_PER_MSEC)) != 0) {
-            dispatch_semaphore_signal(frames);
-            return;
-        }
-        /* Same rule as the synchronous path: tb_present returns without
-         * committing when no drawable is free, so the handler never runs and
-         * the ring slot would leak. Three of those and everything blocks. */
-        if (tb_present(pcb, g.frame[idx], MTLStorageModePrivate, ten) != 0) {
-            dispatch_semaphore_signal(frames);
-        }
-    }
-}
-
 int tb_metal_plane_render_dpcm(const uint8_t *blob, size_t len) {
     /* A whole frame is the single-band case: one band, at row 0, presented
      * immediately.
@@ -1441,6 +1272,11 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
     /* A slice describes a band of a larger surface; a whole frame describes
      * itself. Passing 0 for the frame size means "this blob is the frame". */
     if (frame_w <= 0 || frame_h <= 0) { frame_w = in.width; frame_h = in.height; }
+    if (!tb_metal_frame_dimensions_valid(frame_w, frame_h)) {
+        tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0);
+        return -1;
+    }
+    if (x0 != 0) { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return -1; }
     if (in.width != frame_w) { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return -1; }                       /* bands are full width */
     if (y0 < 0 || (int64_t)y0 + in.height > frame_h) { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return -1; }
     if (y0 % TB_DPCM_TILE) { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return -1; }                         /* must land on a tile row */
@@ -1481,7 +1317,12 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
         id<MTLBuffer> dst = g.frame[g.frame_widx];
 
         id<MTLBuffer> up = tb_upload_take(len);
-        if (!up) { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return -1; }
+        if (!up) {
+            dispatch_semaphore_signal(g.frames_free);
+            g.frame_open = 0;
+            tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0);
+            return -1;
+        }
         double cp0 = tb_mp_now_ms();
         memcpy([up contents], blob, len);
         tb_health_note_upload_copy(tb_mp_now_ms() - cp0);
@@ -1504,6 +1345,13 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
 
         id<MTLCommandBuffer> cb = [g.queue commandBuffer];
         id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+        if (!cb || !ce) {
+            dispatch_semaphore_signal(g.inflight);
+            dispatch_semaphore_signal(g.frames_free);
+            g.frame_open = 0;
+            tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0);
+            return -1;
+        }
         [ce setComputePipelineState:g.dpcmPipe];
         [ce setBuffer:up offset:0 atIndex:0];
         [ce setBuffer:up offset:in.group_table_off atIndex:1];
@@ -1525,52 +1373,12 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
          * synchronise ACROSS queues, and waiting on one within a single queue
          * deadlocks, which is what it did. */
         dispatch_semaphore_t sem = g.inflight;
-        const int async_present = g.async_present;
-
-        if (async_present) {
-            /* Arm BEFORE committing the last band, or its completion handler
-             * could run first and find nothing to do — after which no other
-             * band would ever take the count to zero again. */
-            if (is_last) {
-                /* A mutex, NOT dispatch_sync onto presentQ.
-                 *
-                 * presentQ is serial and spends most of its life inside
-                 * nextDrawable, which blocks until a drawable frees — that is
-                 * what vsync is. dispatch_sync onto a busy serial queue waits
-                 * for it, so arming here used to park THIS thread on a vblank.
-                 * This is the main thread: it also drains the control queue, so
-                 * cursor packets stopped being processed for the duration.
-                 *
-                 * The cursor has its own compositing plane now and still moved
-                 * in steps with vsync on, because the plane was never the
-                 * problem — nothing was delivering positions to it. A lock held
-                 * for three assignments costs nanoseconds and cannot wait on a
-                 * display refresh. */
-                pthread_mutex_lock(&g_present_lock);
-                g.present_idx     = g.frame_widx;
-                g.present_ten_bit = in.ten_bit ? 1 : 0;
-                g.present_armed   = 1;
-                pthread_mutex_unlock(&g_present_lock);
-                g.frame_widx = (g.frame_widx + 1) % TB_FRAME_RING;
-                g.frame_open = 0;
-            }
-            atomic_fetch_add(&g.bands_inflight, 1);
-        }
-
         [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull done) {
             (void)done;
             dispatch_semaphore_signal(sem);
-            if (async_present) {
-                /* Last one out presents. No assumption about the order these
-                 * complete in — only about how many are left. */
-                if (atomic_fetch_sub(&g.bands_inflight, 1) == 1) {
-                    dispatch_async(g.presentQ, ^{ tb_present_armed_frame(); });
-                }
-            }
         }];
         [cb commit];
 
-        if (async_present) { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return 0; }
         if (!is_last) { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return 0; }
 
         /* Wait for this frame's decodes before presenting.
@@ -1590,6 +1398,12 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
          * which is where the pipelining win actually comes from. Only the final
          * band's decode is paid for serially. */
         [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) {
+            dispatch_semaphore_signal(g.frames_free);
+            g.frame_open = 0;
+            tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0);
+            return -1;
+        }
 
         const int presented_idx = g.frame_widx;
         g.frame_widx = (g.frame_widx + 1) % TB_FRAME_RING;
@@ -1597,11 +1411,8 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
 
         dispatch_semaphore_t frames = g.frames_free;
 
-        /* The blob says which depth it carries, so the texture view matches it.
-         * At 8 bits the shader dithers into the 10-bit drawable — what macOS
-         * does with 8-bit content everywhere else. At 10 bits the dither is
-         * still applied but has almost nothing left to spread, because the
-         * samples already resolve the drawable. */
+        /* Match the texture view to the transmitted depth. Ten-bit samples
+         * are presented without dithering so their low bits remain intact. */
         id<MTLCommandBuffer> pcb = [g.queue commandBuffer];
         /* Releases the ring slot once the frame has actually been presented. */
         [pcb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull done) {

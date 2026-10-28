@@ -999,9 +999,8 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
 
 /* A TBD2 blob and nothing else: its own header carries the dimensions and the
  * sample depth, so unlike TB_PKT_RAW_FRAME there is nothing to parse here. The
- * decode runs on the GPU -- see tb_metal_plane.m -- because at 5K it is ~44
- * million bit extractions, which costs 166 ms on this receiver's CPU and 6.5 ms
- * on its GPU. A failed decode drops the frame rather than presenting garbage;
+ * decode runs on the GPU -- see tb_metal_plane.m. Performance depends on the
+ * receiver hardware and must be measured on both Apple Silicon and Intel. A failed decode drops the frame rather than presenting garbage;
  * the codec is lossless, so a partial result is not a degraded picture. */
 static void handle_raw_dpcm(struct app *a, const uint8_t *payload, size_t len) {
     if (tb_disp_render_dpcm(a->disp, payload, len) != 0) return;
@@ -1140,6 +1139,7 @@ static void tb_set_system_volume(double level) {
 
 static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud) {
     struct app *a = (struct app *)ud;
+    if (a->close_requested) return;
     switch (type) {
     case TB_PKT_UI_LANGUAGE:
         {
@@ -1333,14 +1333,25 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
 static int drain_socket(struct app *a) {
     uint8_t buf[1024 * 1024];
     int saw_data = 0;
+    size_t received = 0;
+    const uint64_t started_ms = now_ms();
+    /* DPCM decode/presentation runs in the parser callback. A continuously
+     * readable high-rate stream must still yield to SDL, input and teardown.
+     * The parser retains any partial packet for the next main-loop pass. */
+    const size_t byte_budget = 4 * 1024 * 1024;
+    const uint64_t time_budget_ms = 8;
     for (;;) {
+        if (a->close_requested || received >= byte_budget ||
+            now_ms() - started_ms >= time_budget_ms) return saw_data;
         ssize_t n = read(a->client_fd, buf, sizeof(buf));
         if (n > 0) {
             saw_data = 1;
+            received += (size_t)n;
             if (tb_parser_feed(&a->parser, buf, (size_t)n) < 0) return -1;
         } else if (n == 0) {
             return -1;  /* peer closed */
         } else {
+            if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return saw_data;
             perror("[main] read");
             return -1;

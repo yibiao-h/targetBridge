@@ -55,12 +55,10 @@
  * TWO SAMPLE DEPTHS
  *
  * 8-bit codes the three bytes of a BGRA8888 pixel; 10-bit codes the three
- * fields of an ARGB2101010LE ('l10r') pixel. 10-bit exists because of a
- * measured artefact of the capture path: the virtual display's framebuffer is
- * 8-bit, but the capture-side conversion to Display P3 manufactures sub-8-bit
- * detail on its way into the 10-bit container, and on the panel that detail is
- * the difference between a smooth gradient and a banded one. A codec that only
- * carried 8 bits would permanently trade that quality away for speed.
+ * fields of an ARGB2101010LE ('l10r') pixel. The codec preserves captured
+ * samples at their declared depth. A 10-bit container does not establish the
+ * precision of the source content/framebuffer or the receiver's panel, and
+ * color conversion before capture is outside this lossless contract.
  *
  * Payload lengths vary per tile, so a decoder needs to know where its tile
  * starts. Shipping an offset per tile would cost 4 bytes x 230400 = 921 KB, which

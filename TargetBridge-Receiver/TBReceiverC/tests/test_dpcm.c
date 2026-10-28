@@ -254,6 +254,24 @@ static void test_depths_are_distinct(void) {
     free(back); free(a); free(b); free(f);
 }
 
+/* Every 10-bit level, including all four low-bit combinations, must survive.
+ * Each channel visits the complete 0..1023 range in a different order, so a
+ * codec that rounds to 8-bit or accidentally swaps channels cannot pass. */
+static void test_all_ten_bit_levels(void) {
+    const int w = 1024, h = 8;
+    uint8_t *f = frame_alloc(w, h, 1);
+    CHECK(f != NULL, "10-bit level ramp allocation");
+    if (!f) return;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            put_px(f, w, x, y, pack_px((uint32_t)x,
+                                       1023u - (uint32_t)x,
+                                       ((uint32_t)x * 5u + (uint32_t)y) & 1023u,
+                                       1));
+    roundtrip("all 1024 levels retain their low bits", f, w, h, 1, NULL);
+    free(f);
+}
+
 /* tb_dpcm_parse is the receiver's only defence: it re-derives the whole offset
  * table from the width plane so the GPU decoder can run without a single bounds
  * check. If it ever accepts a blob whose table disagrees, threads read outside
@@ -288,6 +306,13 @@ static void test_parse_rejects_malformed(void) {
 
     memcpy(bad, good, len); bad[13] = 4;
     CHECK(tb_dpcm_parse(bad, len, &in) != 0, "unsupported channel count rejected");
+
+    memcpy(bad, good, len); bad[14] |= 0x80;
+    CHECK(tb_dpcm_parse(bad, len, &in) != 0, "unknown flags rejected");
+    memcpy(bad, good, len); bad[14] &= ~TB_DPCM_FLAG_ALPHA_OMITTED;
+    CHECK(tb_dpcm_parse(bad, len, &in) != 0, "unsupported alpha layout rejected");
+    memcpy(bad, good, len); bad[15] = 1;
+    CHECK(tb_dpcm_parse(bad, len, &in) != 0, "nonzero reserved header rejected");
 
     /* Flipping the depth flag is NOT detectable, and that is worth pinning down
      * rather than wishing otherwise: bit widths and every declared length are
@@ -360,6 +385,7 @@ int main(void) {
         test_mixed_widths(ten_bit);
     }
     test_depths_are_distinct();
+    test_all_ten_bit_levels();
     test_parse_rejects_malformed();
     test_encode_respects_capacity();
 

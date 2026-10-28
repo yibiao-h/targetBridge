@@ -128,7 +128,7 @@ static NSString *tb_enc_shader_source(void) {
      * resid_encode() in tb_dpcm.c exactly. */
     "static inline uint tb_resid(uint cur, uint pred, constant EncParams &P) {\n"
     "  int d = int((cur - pred + P.mid) & P.mask) - int(P.mid);\n"
-    "  return uint((d << 1) ^ (d >> 31));\n"
+    "  return (uint(d) << 1) ^ (0u - uint(d < 0));\n"
     "}\n"
     "\n"
     /* ---- step 1: bit widths, seeds and costs ----
@@ -378,7 +378,7 @@ tb_dpcm_gpu *tb_dpcm_gpu_create(void) {
 
     @autoreleasepool {
         e->dev = MTLCreateSystemDefaultDevice();
-        if (!e->dev) { free(e); return NULL; }
+        if (!e->dev) { tb_dpcm_gpu_destroy(e); return NULL; }
 
         NSError *err = nil;
         id<MTLLibrary> lib = [e->dev newLibraryWithSource:tb_enc_shader_source()
@@ -386,7 +386,7 @@ tb_dpcm_gpu *tb_dpcm_gpu_create(void) {
         if (!lib) {
             fprintf(stderr, "[dpcm-gpu] shader failed: %s\n",
                     err.localizedDescription.UTF8String ?: "?");
-            free(e);
+            tb_dpcm_gpu_destroy(e);
             return NULL;
         }
         e->analyze = [e->dev newComputePipelineStateWithFunction:
@@ -405,10 +405,15 @@ tb_dpcm_gpu *tb_dpcm_gpu_create(void) {
             !e->applyBases || !e->zeroPayload) {
             fprintf(stderr, "[dpcm-gpu] pipeline failed: %s\n",
                     err.localizedDescription.UTF8String ?: "?");
-            free(e);
+            tb_dpcm_gpu_destroy(e);
             return NULL;
         }
         e->queue = [e->dev newCommandQueue];
+        if (!e->queue) {
+            fprintf(stderr, "[dpcm-gpu] command queue unavailable\n");
+            tb_dpcm_gpu_destroy(e);
+            return NULL;
+        }
         e->plan_q = dispatch_queue_create("com.targetbridge.dpcm.plan",
                                           DISPATCH_QUEUE_SERIAL);
         e->slots  = dispatch_semaphore_create(TB_DPCM_GPU_JOBS);
@@ -608,6 +613,7 @@ size_t tb_dpcm_gpu_encode_bands(tb_dpcm_gpu *e,
     if (ensure_buffer(e, &e->offs, &e->offs_cap, offs_span * (size_t)band_count) != 0) return 0;
 
     size_t payload_bytes[TB_DPCM_GPU_MAX_BANDS];
+    tb_dpcm_gpu_band completed_bands[TB_DPCM_GPU_MAX_BANDS];
     size_t total_all = 0;
 
     @autoreleasepool {
@@ -652,7 +658,9 @@ size_t tb_dpcm_gpu_encode_bands(tb_dpcm_gpu *e,
          * letting bands overlap would buy almost nothing, and the win here is
          * the round trip, not intra-GPU concurrency. */
         id<MTLCommandBuffer> cb = [e->queue commandBuffer];
+        if (!cb) return 0;
         id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+        if (!ce) return 0;
         [ce setComputePipelineState:e->analyze];
         [ce setBytes:&P length:sizeof(P) atIndex:3];
         for (int b = 0; b < band_count; ++b) {
@@ -665,8 +673,9 @@ size_t tb_dpcm_gpu_encode_bands(tb_dpcm_gpu *e,
         [ce endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
-        if (cb.error) {
-            fprintf(stderr, "[dpcm-gpu] analyze: %s\n", cb.error.localizedDescription.UTF8String);
+        if (cb.status != MTLCommandBufferStatusCompleted || cb.error) {
+            fprintf(stderr, "[dpcm-gpu] analyze: %s\n",
+                    cb.error.localizedDescription.UTF8String ?: "command buffer did not complete");
             return 0;
         }
 
@@ -729,8 +738,8 @@ size_t tb_dpcm_gpu_encode_bands(tb_dpcm_gpu *e,
 
             /* The reserved run ends where the blob begins, so the caller's
              * header and the payload are one contiguous buffer. */
-            out[b].blob = blob - header_reserve;
-            out[b].len  = header_reserve + total;
+            completed_bands[b].blob = blob - header_reserve;
+            completed_bands[b].len  = header_reserve + total;
             total_all  += header_reserve + total;
         }
 
@@ -740,7 +749,9 @@ size_t tb_dpcm_gpu_encode_bands(tb_dpcm_gpu *e,
          * the fills go in one blit encoder ahead of the packs: separate encoders
          * in a command buffer run in order, which is the dependency we need. */
         cb = [e->queue commandBuffer];
+        if (!cb) return 0;
         id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+        if (!be) return 0;
         for (int b = 0; b < band_count; ++b) {
             [be fillBuffer:e->blob
                      range:NSMakeRange(band_span * (size_t)b + blob_off + payload_off,
@@ -750,6 +761,7 @@ size_t tb_dpcm_gpu_encode_bands(tb_dpcm_gpu *e,
         [be endEncoding];
 
         ce = [cb computeCommandEncoder];
+        if (!ce) return 0;
         [ce setComputePipelineState:e->pack];
         [ce setBytes:&P length:sizeof(P) atIndex:5];
         const NSUInteger threads = (NSUInteger)tile_count * 3;
@@ -767,11 +779,15 @@ size_t tb_dpcm_gpu_encode_bands(tb_dpcm_gpu *e,
         [ce endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
-        if (cb.error) {
-            fprintf(stderr, "[dpcm-gpu] pack: %s\n", cb.error.localizedDescription.UTF8String);
+        if (cb.status != MTLCommandBufferStatusCompleted || cb.error) {
+            fprintf(stderr, "[dpcm-gpu] pack: %s\n",
+                    cb.error.localizedDescription.UTF8String ?: "command buffer did not complete");
             return 0;
         }
     }
+    /* Publish only after both submissions completed. The API promises to leave
+     * the caller's outputs untouched when any stage fails. */
+    memcpy(out, completed_bands, sizeof(*out) * (size_t)band_count);
     return total_all;
 }
 

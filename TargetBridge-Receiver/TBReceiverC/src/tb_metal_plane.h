@@ -21,12 +21,16 @@ void tb_metal_plane_shutdown(void);
 /* Non-zero once init() has succeeded. */
 int  tb_metal_plane_available(void);
 
-/* Non-zero if this receiver can decode TBD1 frames on the GPU. Gates the
+/* Non-zero if this receiver can decode TBD2 frames on the GPU. Gates the
  * "supportsDPCM" capability it advertises to the sender: the CPU reference
  * decoder is far too slow to stand in at 5K (166 ms/frame measured on the
  * target iMac's i5, against 6.5 ms on its GPU), so a receiver without a working
  * compute pipeline must keep receiving uncompressed frames. */
 int  tb_metal_plane_supports_dpcm(void);
+
+/* Validate the blob and transport dimensions before creating a display plane.
+ * This performs no Metal or window work. */
+int  tb_metal_plane_accepts_dpcm(const uint8_t *blob, size_t len);
 
 /* Present without waiting for the display's refresh boundary.
  *
@@ -41,8 +45,8 @@ int  tb_metal_plane_supports_dpcm(void);
  * and rebuilt whenever the SDL status UI takes the window back. */
 void tb_metal_plane_set_vsync(int enabled);
 
-/* Show/hide the video plane. Hidden while the SDL status/connecting UI owns
- * the window, shown once frames arrive. */
+/* Show a successfully submitted video frame. Hiding releases the Metal view
+ * so SDL can render status UI, NV12, or ordinary decoded video again. */
 void tb_metal_plane_set_hidden(int hidden);
 
 /* Cursor overlay state, in source-frame coordinates.
@@ -53,7 +57,7 @@ void tb_metal_plane_set_hidden(int hidden);
  * rectangles patch the frame in place a stamped cursor would leave a trail
  * everywhere it had been. */
 void tb_metal_plane_set_cursor(int x, int y, int source_w, int source_h,
-                               int visible, int type);
+                               int visible, int type, int large);
 
 /* Adopt the sender's actual cursor bitmap. Premultiplied RGBA8, `w`*`h` pixels,
  * with the hot spot in the same pixel space. Replaces the drawn arrow for every
@@ -69,8 +73,7 @@ void tb_metal_plane_note_cursor_arrival(double recv_ms);
 
 /* Apply any pending cursor position. Call once per run-loop pass.
  *
- * set_cursor only marks dirty: placing inline put a window-server round trip in
- * the packet handler at up to 120 Hz and stalled the loop that drains video. */
+ * set_cursor only marks dirty; flush applies the state on the main loop. */
 void tb_metal_plane_flush_cursor(void);
 
 /* Present one packed 32-bit frame straight from CPU memory. `ten_bit` selects

@@ -124,7 +124,9 @@ static inline uint32_t sample_of(uint32_t px, int c, const struct depth *d) {
  * is needed anywhere and the round trip is exact. */
 static inline uint32_t resid_encode(uint32_t cur, uint32_t pred, const struct depth *d) {
     int32_t diff = (int32_t)((cur - pred + d->half) & d->mask) - (int32_t)d->half;
-    return (uint32_t)((diff << 1) ^ (diff >> 31));
+    /* Shift unsigned values: left-shifting a negative signed residual is UB.
+     * The explicit sign mask also avoids implementation-defined signed shifts. */
+    return ((uint32_t)diff << 1) ^ (0u - (uint32_t)(diff < 0));
 }
 
 static inline uint32_t resid_decode(uint32_t z, uint32_t pred, const struct depth *d) {
@@ -334,6 +336,11 @@ int tb_dpcm_parse(const uint8_t *src, size_t len, struct tb_dpcm_info *out) {
     if (src[12] != 3 || src[13] != TB_DPCM_CHANNELS) return -1;
 
     const uint8_t flags = src[14];
+    /* TBD2 carries RGB only. Unknown layouts must not be silently decoded as
+     * opaque RGB; future extensions require explicit format negotiation. */
+    const uint8_t known_flags = TB_DPCM_FLAG_ALPHA_OMITTED | TB_DPCM_FLAG_TEN_BIT;
+    if (!(flags & TB_DPCM_FLAG_ALPHA_OMITTED) || (flags & ~known_flags) || src[15] != 0)
+        return -1;
     const int ten_bit = (flags & TB_DPCM_FLAG_TEN_BIT) ? 1 : 0;
     const int max_width = ten_bit ? 10 : 8;
 

@@ -67,7 +67,6 @@
 		E81B28F81AE82FF904E0871F /* TBAddonStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06D011FF8AF7BB6D26EDC25B /* TBAddonStore.swift */; };
 		E9F7A263085592067562F768 /* TBDisplaySenderStatusItemController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6AC1AF99431D4889F947CE1B /* TBDisplaySenderStatusItemController.swift */; };
 		F2274C924BAC479635B44A47 /* TBDisplaySenderManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4644CFB05098C895378B648A /* TBDisplaySenderManager.swift */; };
-		FABFF5F2E3BBAD92EC577431 /* tb_dpcm.o in Resources */ = {isa = PBXBuildFile; fileRef = C0040E13C70B1D78B70EE14E /* tb_dpcm.o */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -128,7 +127,6 @@
 		B8DD299CAF964F041C2A4D1A /* TBExtendedArrangementMigration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBExtendedArrangementMigration.swift; sourceTree = "<group>"; };
 		B95D015FB8DF172C7418CB5D /* TBDisplaySenderSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBDisplaySenderSettingsView.swift; sourceTree = "<group>"; };
 		BAD8054BAF22B0176188F75E /* TBReceiverPreferenceMigrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBReceiverPreferenceMigrationTests.swift; sourceTree = "<group>"; };
-		C0040E13C70B1D78B70EE14E /* tb_dpcm.o */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.objfile"; path = tb_dpcm.o; sourceTree = "<group>"; };
 		C11B4EB862393E5CE95426D4 /* TBCaptureHealthTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBCaptureHealthTests.swift; sourceTree = "<group>"; };
 		C242540F9DE94E1364F106F4 /* ReceiverBackedVirtualDisplaySession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceiverBackedVirtualDisplaySession.swift; sourceTree = "<group>"; };
 		C3658E86F5BE2168F4591491 /* de.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = de.json; sourceTree = "<group>"; };
@@ -222,7 +220,6 @@
 				76E6FFA1E69D5AA79D3C772B /* tb_dpcm_gpu.m */,
 				099FF6E60BF6BB314C99A5A9 /* tb_dpcm.c */,
 				8929B2BF713B84404771C38B /* tb_dpcm.h */,
-				C0040E13C70B1D78B70EE14E /* tb_dpcm.o */,
 			);
 			path = codec;
 			sourceTree = "<group>";
@@ -386,7 +383,6 @@
 				233BAEE5ABED3F316F9D3D12 /* input-dockstation.json in Resources */,
 				7FB34AA1E75B01E7D1EC3E21 /* it.json in Resources */,
 				C1A77120267A12D9E355DCEA /* network-link.json in Resources */,
-				FABFF5F2E3BBAD92EC577431 /* tb_dpcm.o in Resources */,
 				E6A3663426721C75734F5BC5 /* zh.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

@@ -14,8 +14,7 @@
 
 /* The lossless tile-DPCM encoder, shared with the receiver. Swift calls
  * tb_dpcm_gpu_* directly; see TargetBridge-Shared/codec/tb_dpcm.h for the wire
- * format and TBDPCMAsyncEncode.swift for how the encode is kept off the capture
- * thread. */
+ * format. TBVideoPipeline owns the encoder on its serial capture queue. */
 #import "tb_dpcm.h"
 #import "tb_dpcm_gpu.h" 
 

@@ -57,6 +57,8 @@ final class TBMonitorProtocolTests: XCTestCase {
         """.utf8)
         let profile = try JSONDecoder().decode(TBMonitorDisplayProfile.self, from: olderProfile)
         XCTAssertNil(profile.supportsRawNV12)
+        XCTAssertNil(profile.supportsDPCM)
+        XCTAssertEqual(TBMonitorPacketType.rawDPCM.rawValue, 0x25)
     }
 
     func testDrainPacketRoundTrip() throws {

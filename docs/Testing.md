@@ -132,3 +132,37 @@ the session card, whether input remains responsive, and any capture or decoder
 errors. For a two-receiver experiment, start one session per receiver and
 record the FPS for each session separately. Include the sender model, macOS
 version, receiver model, cable type, and selected transport with the report.
+
+## Experimental DPCM transport
+
+`make test` also runs the hardware-free TBD2 reference codec suite at 8 and
+10 bits, including all 1024 RGB channel values. The Sender unit tests cover
+capability negotiation, `l10r`/Display P3 capture configuration, invalid buffer
+rejection and the CPU encoder fallback. Receiver lifecycle guards run with:
+
+```bash
+python3 TargetBridge-Receiver/TBReceiverC/tests/test_dpcm_display.py
+python3 TargetBridge-Receiver/TBReceiverC/tests/test_socket_drain.py
+```
+
+For synthetic GPU encoder/reference parity (no screen capture):
+
+```bash
+cd TargetBridge-Receiver/TBReceiverC
+make test-dpcm-gpu
+```
+
+For Receiver GPU decode/readback and a small-window lifecycle smoke test:
+
+```bash
+cd TargetBridge-Receiver/TBReceiverC
+make test-dpcm-metal
+```
+
+This optional check needs SDL2 and a GUI session, and uses synthetic pixels only.
+It verifies all 1024 channel values, partial tiles, first-frame presentation,
+legacy fallback/teardown, and rejection before oversized GPU allocations.
+
+Exit 77 from the GPU encoder test means Metal is unavailable, not that GPU validation passed. Run real
+screen capture and presentation separately on both Apple Silicon and Intel
+receivers; see [the DPCM transport contract](Lossless-5K60.md).

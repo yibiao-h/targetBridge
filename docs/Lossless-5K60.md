@@ -1,134 +1,126 @@
-# How the 5K60 lossless path works
+# Experimental 10-bit RGB DPCM transport
 
-A 5120×2880 desktop at 60 fps, 4:4:4 10-bit, **bit-exact** — no chroma
-subsampling, no quantisation, no generational loss. Apple Silicon sender to a
-2020 Retina 5K iMac over one Thunderbolt cable.
+`native5kRaw60` targets 5120 × 2880 at up to 60 FPS. It requests packed
+10-bit RGB (`l10r`, ARGB2101010 little endian) from ScreenCaptureKit and
+losslessly transmits the captured RGB samples using TBD2 tile-DPCM.
+This is an experimental transport, not a guarantee of sustained 5K60,
+HDR, native 10-bit source content, or 10-bit panel scanout.
 
-This is what the constraints forced, and what the measurements said when they
-disagreed with the reasoning. Every number here was measured on that hardware.
+## Capture and color contract
 
-## The constraint
+The DPCM session explicitly requests `kCVPixelFormatType_ARGB2101010LEPacked`
+and `CGColorSpace.displayP3`. The receiver labels its `BGR10A2Unorm`
+CAMetalLayer as Display P3 too. ScreenCaptureKit documents `l10r` as a
+supported [output pixel format](https://developer.apple.com/documentation/screencapturekit/scstreamconfiguration/pixelformat).
 
-A 5K frame at 4:4:4 10-bit is **59 MB**. At 60 fps that is **3.5 GB/s** — 28
-Gb/s, comfortably inside a 40 Gb/s link. Bandwidth was never the problem.
+Capture startup and delayed callbacks are tied to the current connection and
+capture attempt. A stop/reconnect during an asynchronous start discards the old
+stream instead of publishing it into the new session.
 
-The receiver was. Measured on the 2020 iMac, per full frame:
+The sender checks the delivered CVPixelBuffer format and layout before reading
+any samples. NV12 and BGRA are rejected rather than interpreted as packed
+10-bit RGB. The encoder preserves all 1024 values per RGB channel, including
+the low two bits. Alpha is omitted and reconstructed as opaque.
 
-| Stage | Cost |
+This contract begins **after capture and color conversion**. Choosing a 10-bit
+buffer does not create source precision that an application, source display,
+or virtual framebuffer did not have. This change does not modify the private
+virtual-display transfer-function API. Color conversion, scaling and final
+panel scanout are outside the codec's bit-exact guarantee. Capture remains SDR.
+
+## Negotiation and fallback
+
+| Receiver / selected mode | Capture and wire format |
 |---|---|
-| Pulling bytes off the wire | **23.4 ms** (single core, inside the TCP stack) |
-| Pushing them across PCIe to the GPU | **12.9 ms** |
-| Budget for 60 fps | **16.7 ms** |
+| DPCM preset, receiver advertises a working Metal DPCM decoder | Display P3 10-bit RGB, TBD2 (`0x25`) |
+| DPCM preset, old receiver supports raw NV12 | 8-bit NV12, existing raw packet (`0x22`) |
+| DPCM preset, receiver supports neither DPCM nor raw NV12 | Existing HEVC/H.264 path, subject to encoder availability |
+| Existing preset | Existing encoded path, or explicitly enabled `RAW=1` NV12 |
 
-Either stage alone blows the budget. Both costs scale with frame size, so the
-cheapest way to raise the frame rate is to send fewer bytes — but the goal is
-losslessness, so nothing can be discarded.
+Absent capability fields mean unsupported. Selection happens before capture
+starts, so a packed RGB frame never reaches the planar NV12 sender. The active
+codec label distinguishes DPCM RGB 10-bit, NV12 RAW 8-bit and encoded transport.
+A receiver without usable Metal continues advertising the legacy formats.
+The receive loop yields after a byte/time budget so a continuously readable
+video stream cannot starve window events or input; teardown stops dispatching
+further packets from the same batch.
+Capability probing does not create a visible Metal layer over the status UI.
 
-That rules out the obvious answer. HEVC cuts bytes ~100×, but it is lossy, its
-hardware path is 4:2:0 8-bit, and on this iMac it could not hold 60 fps anyway.
-The codec has to be lossless *and* cheap enough for a GPU that is otherwise idle
-while the CPU saturates.
+If GPU encoding cannot be created or fails in a negotiated DPCM session, the
+CPU reference encoder emits the same 10-bit TBD2 format. It may be much slower;
+backpressure and the existing frame-rate ceiling still apply. There is no
+silent conversion to 8-bit NV12. Invalid capture frames are rejected and logged.
+The direct CGDisplayStream mirror fallback is used only for encoded sessions;
+it does not silently substitute its 8-bit buffers into a DPCM session.
 
-## TBD2: lossless tile-DPCM
+The receiver creates the Metal layer only for incoming DPCM frames, shows it
+after a successful frame, and releases it on NV12/encoded fallback, disconnect
+or window destruction. The currently integrated whole-frame decoder uses
+ordered presentation, avoiding the unfinished asynchronous band-present path.
 
-DPCM codes each sample as its difference from a prediction rather than its
-absolute value. Neighbouring pixels are usually close, so differences are small
-and pack into fewer bits; the prediction is reproducible on the far end, so
-nothing is lost.
+## Codec
 
-Measured on real content:
+TBD2 splits frames into independent 8 × 8 tiles. Each tile stores its first
+pixel and per-channel residual widths. Remaining pixels predict from the left,
+except the first column which predicts from above. Modular residuals and zigzag
+coding preserve samples exactly at either supported codec depth (8 or 10 bits).
+The current Sender DPCM preset accepts only 10-bit capture.
 
-| Content | Ratio |
+Groups of 64 tiles share an offset table. The CPU parser checks dimensions,
+widths, payload sizes and group offsets before the Metal decoder accesses the
+blob. Display allocations are additionally limited to 5120 × 2880, matching
+the current Sender transport, even when a small valid blob describes a much
+larger flat image. GPU encoding is compared byte-for-byte with the reference C encoder in
+the optional synthetic-pixel test.
+
+| Component | Source |
 |---|---|
-| 36-megapixel photo (near worst case) | **2.96×** |
-| Text-heavy UI | **4.5×** |
-| Ordinary window chrome | **13.8×** |
+| Wire format and CPU reference | `TargetBridge-Shared/codec/tb_dpcm.h`, `tb_dpcm.c` |
+| GPU encoder | `TargetBridge-Shared/codec/tb_dpcm_gpu.h`, `tb_dpcm_gpu.m` |
+| Capture negotiation and buffer validation | `TBVideoTransport`, `TBDPCMFrameEncoder` in `TBDisplaySenderService.swift` |
+| Receiver GPU decode and display | `TargetBridge-Receiver/TBReceiverC/src/tb_metal_plane.m` |
 
-LZFSE manages 3.48× on that same photo, so this captures 85% of what a
-general-purpose compressor gets while staying cheap enough to run per-tile on a
-GPU. That turns the 23.4 ms receive into roughly 8 ms, and the frame fits.
+## Compatibility and verification
 
-### Why tiles
+Both Apple Silicon receivers (including M1 iMac) and Intel receivers remain
+supported targets. A capability probe, not the CPU model, controls DPCM
+availability. Existing CI builds both `arm64` and `x86_64`. No new OS minimum is
+introduced. The initial proposal's measurements came from a separate fork on
+a 2020 Intel 5K iMac; they do not establish performance on M1 iMac or on this
+integration. A 40 Gb/s cable rating is not application throughput.
 
-Textbook DPCM is **serial** — pixel N depends on N−1 — which is fatal on a GPU,
-and the GPU is the only spare compute the receiver has. So the frame is cut into
-**8×8 tiles that are fully independent**: each carries its own seed pixel and bit
-widths and needs nothing from any neighbour. **230,400 threadgroups** at 5K.
-DPCM *within* a tile, parallel *across* tiles.
+Hardware-free checks:
 
-**8×8 was measured, not chosen.** 4×4 wins slightly on dense text (4.71× vs
-4.46×) and loses badly on flat content (9.7× vs 13.8×), paying four times the
-per-tile overhead where there is nothing to code. 16×16 loses everywhere: one
-high-contrast edge sets the bit width for 256 pixels.
+```sh
+cd TargetBridge-Receiver/TBReceiverC
+make test
+```
 
-The predictor is the **left neighbour**, first column predicting from above.
-JPEG-LS's median-edge predictor ties it to within 1% on every frame tested,
-including the photo, and costs three extra loads and a clamp — inside an 8×8 tile
-there is not enough vertical run for it to earn them.
+This includes the C codec tests, with complete 0–1023 RGB ramps and malformed
+packet coverage. For the GPU encoder, using synthetic pixels only:
 
-Residuals are taken modulo the sample range and re-centred, so reconstruction
-wraps and stays exact. Zigzagged, the widest possible residual needs exactly the
-sample depth — the same as a raw sample — so **a tile can never expand beyond its
-header**, and no escape hatch is needed for pathological content.
+```sh
+make test-dpcm-gpu
+```
 
-### Why the decoder is on the GPU
+The GPU test compares 8-bit and 10-bit GPU output with the CPU reference, injects GPU creation/submission failures, then
+checks decoded pixels, padded rows and partial tiles. It requires a usable
+Metal device; exit 77 means unavailable, not a passing GPU test.
 
-Decoding costs roughly **44 million bit extractions** per 5K frame. Measured on
-the target iMac: **166 ms single-threaded on the i5**, against **6.5 ms on its
-GPU**. The CPU was never an option — it is the bottleneck this codec exists to
-relieve.
+For receiver decode and presentation with synthetic pixels, run
+`make test-dpcm-metal`. This requires SDL2 and a logged-in GUI session, opens a
+small test window, compares GPU decoded buffers with the CPU reference, and
+checks first-frame visibility, teardown and oversized-frame rejection. It does
+not capture the screen or change display settings.
 
-## The rest of the pipeline
+Sender XCTest coverage checks capability combinations, the actual SCStream
+configuration, rejection of incompatible pixel buffers and CPU fallback
+round-trips of all 1024 channel values. See [Testing](Testing.md) for commands.
 
-Points where measurement contradicted the reasonable guess:
-
-**Capture.** `SCStream`'s `minimumFrameInterval` is a *throttle*, not a request.
-Asking for `CMTime(1, 60)` at 60 Hz caused two-period capture gaps; `.zero` is
-required. `queueDepth` is resolution-dependent: at 5K the capture callback runs
-10–14 ms against a 16.7 ms period, so a shallow queue leaves ScreenCaptureKit
-nowhere to put the next frame — and a stalled stream delivers **nothing**, not a
-stale frame, which reads as "macOS did not draw it".
-
-**10-bit.** A virtual display is 8-bpc because it is SDR. Declaring a transfer
-function is what promotes the framebuffer to 16-bpc, and it is the *only* reason
-the 10-bit path carries real bits rather than 8-bit values replicated into 10.
-
-**Rendering.** SDL2 cannot present 10-bit, so the receiver adds a `CAMetalLayer`
-and drives the drawable at the frame's own resolution. The cursor is a separate
-`CALayer` child: while it was drawn into the frame it carried the whole pipeline
-cost — capture, encode, transfer, decode, present, vblank — which is why vsync
-visibly affected pointer movement.
-
-## The instruments that lie
-
-Most expensive mistakes here shared one shape: a mechanism reasoned out, built,
-then found wrong. Several instruments read *healthy* while the thing they named
-was broken:
-
-- A cadence histogram with a hardcoded reference period goes blind when that
-  period changes, and fails by looking **perfect**.
-- A full 60 fps with zero drops is not health: a bad send phase shows
-  `drawable 16.6 ms` and 27 ms cursor latency while every rate counter reads
-  perfect.
-- `nc -z` proves the kernel completed a handshake, not that the app ever called
-  `accept()`.
-
-## Reading the code
-
-| What | Where |
-|---|---|
-| Wire format, tile layout, rationale | `TargetBridge-Shared/codec/tb_dpcm.h` |
-| CPU reference encoder/decoder | `TargetBridge-Shared/codec/tb_dpcm.c` |
-| GPU encoder | `TargetBridge-Shared/codec/tb_dpcm_gpu.h` |
-| Metal decode + cursor plane | `TargetBridge-Receiver/TBReceiverC/src/tb_metal_plane.m` |
-| Packet IDs (both ends agree here) | `TargetBridge-Receiver/TBReceiverC/src/proto.h` |
-
-The headers carry the reasoning inline, including the measurement behind each
-constant and the alternatives tried and rejected.
-
-## What this is not
-
-Not a general-purpose codec. TBD2 assumes a desktop image on a short, reliable
-link with bandwidth to spare and a receiver whose GPU is idle. On a lossy network,
-or where bandwidth is the scarce resource, a lossy codec is the right answer —
-which is why the other presets exist.
+Before calling the path ready for general use, run real two-machine sessions
+on Apple Silicon and Intel receivers. Record source and receiver model, macOS
+version, selected display mode, actual capture format, transport, sustained FPS,
+queue drops, CPU/GPU cost, color gradients/text, cursor, disconnect/reconnect
+and fallback behavior. M1 iMac is one test target, not the sole supported setup.
+Synthetic codec tests do not verify screen capture, GPU presentation, panel
+precision or sustained two-machine throughput.
