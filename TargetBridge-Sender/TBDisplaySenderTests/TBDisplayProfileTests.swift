@@ -113,9 +113,140 @@ final class TBDPCMTransportTests: XCTestCase {
 
     func testDPCMRejectsNV12AndEightBitRGBInsteadOfReinterpretingMemory() throws {
         let encoder = TBDPCMFrameEncoder(useGPU: false)
-        XCTAssertNil(encoder.encode(try buffer(format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, width: 64, height: 64)))
-        XCTAssertNil(encoder.encode(try buffer(format: kCVPixelFormatType_32BGRA)))
-        XCTAssertNil(encoder.encode(try buffer(format: kCVPixelFormatType_ARGB2101010LEPacked, width: 5121)))
+        let invalidBuffers = [
+            try buffer(format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, width: 64, height: 64),
+            try buffer(format: kCVPixelFormatType_32BGRA),
+            try buffer(format: kCVPixelFormatType_ARGB2101010LEPacked, width: 5121)
+        ]
+        for pixelBuffer in invalidBuffers {
+            XCTAssertNil(encoder.encode(pixelBuffer))
+            XCTAssertNil(encoder.encodePacket(pixelBuffer))
+        }
+    }
+
+    func testCPUOwnedPacketsRetainTenBitPixelsAcrossEncoderReuseAndDestruction() throws {
+        try assertOwnedPacketsSurviveReuse(useGPU: false)
+    }
+
+    func testGPUOwnedPacketsRetainTenBitPixelsAcrossEncoderReuseAndDestruction() throws {
+        guard let probe = tb_dpcm_gpu_create() else {
+            throw XCTSkip("Metal DPCM encoder unavailable")
+        }
+        tb_dpcm_gpu_destroy(probe)
+        try assertOwnedPacketsSurviveReuse(useGPU: true)
+    }
+
+    private func assertOwnedPacketsSurviveReuse(useGPU: Bool) throws {
+        let width = 1024, height = 3
+        let pixelBuffer = try buffer(format: kCVPixelFormatType_ARGB2101010LEPacked,
+                                     width: width, height: height)
+        var encoder: TBDPCMFrameEncoder? = TBDPCMFrameEncoder(useGPU: useGPU)
+        var retained: [(packet: Data, pixels: Data)] = []
+        for frame in 0..<8 {
+            XCTAssertEqual(CVPixelBufferLockBaseAddress(pixelBuffer, []), kCVReturnSuccess)
+            let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(pixelBuffer))
+            let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
+            var pixels = Data(capacity: width * height * 4)
+            for y in 0..<height {
+                let row = base.advanced(by: y * stride).assumingMemoryBound(to: UInt32.self)
+                for x in 0..<width {
+                    let blue = UInt32((x + frame) & 1023)
+                    let green = UInt32((1023 - x + frame + y) & 1023)
+                    let red = UInt32((x * 5 + frame + y) & 1023)
+                    row[x] = (3 << 30) | (red << 20) | (green << 10) | blue
+                }
+                pixels.append(base.advanced(by: y * stride).assumingMemoryBound(to: UInt8.self), count: width * 4)
+            }
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+            retained.append((try XCTUnwrap(encoder?.encodePacket(pixelBuffer)), pixels))
+            for snapshot in retained {
+                try assertPacket(snapshot.packet, decodesTo: snapshot.pixels, width: width, height: height)
+            }
+        }
+        encoder = nil
+        for snapshot in retained {
+            try assertPacket(snapshot.packet, decodesTo: snapshot.pixels, width: width, height: height)
+        }
+    }
+
+    private func assertPacket(_ packet: Data, decodesTo pixels: Data, width: Int, height: Int) throws {
+        XCTAssertEqual(Int(TBMonitorProtocol.readBE32(packet, offset: 0)), packet.count - 4)
+        var wire = packet
+        let (type, payload) = try XCTUnwrap(try TBMonitorProtocol.drainPacket(from: &wire))
+        XCTAssertEqual(type, .rawDPCM)
+        XCTAssertTrue(wire.isEmpty)
+        XCTAssertEqual(packet, TBMonitorProtocol.makePacket(type: .rawDPCM, payload: payload))
+        var info = tb_dpcm_info()
+        var decoded = Data(count: width * height * 4)
+        payload.withUnsafeBytes { input in
+            let base = input.bindMemory(to: UInt8.self).baseAddress
+            XCTAssertEqual(tb_dpcm_parse(base, payload.count, &info), 0)
+            XCTAssertEqual(info.ten_bit, 1)
+            XCTAssertEqual(info.width, Int32(width))
+            XCTAssertEqual(info.height, Int32(height))
+            decoded.withUnsafeMutableBytes { output in
+                XCTAssertEqual(tb_dpcm_decode(base, payload.count,
+                    output.bindMemory(to: UInt8.self).baseAddress, Int32(width * 4)), 0)
+            }
+        }
+        XCTAssertEqual(decoded, pixels)
+    }
+}
+
+final class TBVirtualDisplayModeSelectionTests: XCTestCase {
+    private typealias Candidate = TBVirtualDisplayModeSelection.Candidate
+    private let standard = Candidate(pointWidth: 2240, pointHeight: 1260,
+                                     pixelWidth: 2240, pixelHeight: 1260, refreshRate: 60)
+    private let retina = Candidate(pointWidth: 2240, pointHeight: 1260,
+                                   pixelWidth: 4480, pixelHeight: 2520, refreshRate: 60)
+    private let requested = TBVirtualDisplayModeSize(width: 2240, height: 1260)
+
+    func testSameLogicalSizeSelectsHiDPIRegardlessOfEnumerationOrder() {
+        XCTAssertEqual(TBVirtualDisplayModeSelection.preferredIndex(
+            in: [standard, retina], mode: requested, refreshRate: 60), 1)
+        XCTAssertEqual(TBVirtualDisplayModeSelection.preferredIndex(
+            in: [retina, standard], mode: requested, refreshRate: 60), 0)
+    }
+
+    func testHiDPIModeMustBeAvailableBeforeStartupCanSelectIt() {
+        // The standard variant can appear before WindowServer publishes HiDPI.
+        // It must not end the startup retry loop with the wrong backing size.
+        XCTAssertNil(TBVirtualDisplayModeSelection.preferredIndex(
+            in: [standard], mode: requested, refreshRate: 60))
+        XCTAssertEqual(TBVirtualDisplayModeSelection.preferredIndex(
+            in: [standard, retina], mode: requested, refreshRate: 60), 1)
+    }
+
+    func testNative1080pStillSelectsOneToOnePixels() {
+        let native = Candidate(pointWidth: 1920, pointHeight: 1080,
+                               pixelWidth: 1920, pixelHeight: 1080, refreshRate: 60)
+        let doubled = Candidate(pointWidth: 1920, pointHeight: 1080,
+                                pixelWidth: 3840, pixelHeight: 2160, refreshRate: 60)
+        let mode = TBVirtualDisplayModeSize(width: 1920, height: 1080, isHiDPI: false)
+        XCTAssertEqual(TBVirtualDisplayModeSelection.preferredIndex(
+            in: [doubled, native], mode: mode, refreshRate: 60), 1)
+        XCTAssertNil(TBVirtualDisplayModeSelection.preferredIndex(
+            in: [doubled], mode: mode, refreshRate: 60))
+    }
+
+    func testSavedChoicePreservesBothHiDPIAndExplicitStandardModes() throws {
+        for (index, choice) in [standard, retina].enumerated() {
+            let restored = try JSONDecoder().decode(Candidate.self, from: JSONEncoder().encode(choice))
+            XCTAssertEqual(TBVirtualDisplayModeSelection.savedIndex(
+                in: [standard, retina], choice: restored), index)
+        }
+        XCTAssertNil(TBVirtualDisplayModeSelection.savedIndex(in: [standard], choice: retina))
+    }
+
+    func testModeSwitchSuccessRequiresMatchingBackingReadback() {
+        XCTAssertFalse(TBVirtualDisplayModeSelection.applyAndVerify(retina,
+            apply: { true }, readBack: { self.standard }))
+        XCTAssertFalse(TBVirtualDisplayModeSelection.applyAndVerify(retina,
+            apply: { true }, readBack: { nil }))
+        XCTAssertTrue(TBVirtualDisplayModeSelection.applyAndVerify(retina,
+            apply: { true }, readBack: { self.retina }))
+        XCTAssertFalse(TBVirtualDisplayModeSelection.applyAndVerify(retina,
+            apply: { false }, readBack: { XCTFail("failed switch must not be published"); return self.retina }))
     }
 }
 

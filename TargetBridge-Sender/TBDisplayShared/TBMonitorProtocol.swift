@@ -153,6 +153,18 @@ enum TBMonitorProtocol {
         return packet
     }
 
+    /// Copy a borrowed encoder payload directly into its final owned packet.
+    /// The returned Data remains valid when the encoder reuses its storage.
+    static func makePacket(type: TBMonitorPacketType, payloadBytes: UnsafeBufferPointer<UInt8>) -> Data {
+        var packet = Data(capacity: 5 + payloadBytes.count)
+        appendBE32(&packet, UInt32(1 + payloadBytes.count))
+        packet.append(type.rawValue)
+        if let base = payloadBytes.baseAddress {
+            packet.append(base, count: payloadBytes.count)
+        }
+        return packet
+    }
+
     static func makeJSONPacket<T: Encodable>(type: TBMonitorPacketType, value: T) -> Data? {
         let encoder = JSONEncoder()
         guard let payload = try? encoder.encode(value) else { return nil }

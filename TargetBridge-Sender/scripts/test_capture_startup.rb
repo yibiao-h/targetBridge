@@ -20,6 +20,12 @@ abort 'old first-frame callback must be rejected' unless capture&.match?(/onFirs
 abort 'old audio must not enter a replacement connection' unless capture&.match?(/delegate\.onAudio.*?self\.pipeline === pipeline.*?isCurrentCaptureAttempt.*?connection\.send/m)
 abort 'stale restart must not stop a replacement session' unless restart&.match?(/let started = await startCapture\(for: profile\)\s+guard isCurrentCaptureAttempt.*?if !started/m)
 abort 'virtual-display destruction must not be deferred past reconnect' if source.include?('currentSession.destroy()')
+direct = source[/private func startDirectDisplayStream\(.*?(?=    private func activityOptions)/m]
+abort 'direct video must reject a stop during auxiliary audio startup' unless direct&.match?(/await startAuxiliaryAudioCapture.*?guard isCurrentCaptureAttempt.*?self\.directDisplayStream === directCapture.*?directCapture\.stop/m)
+abort 'auxiliary audio must own and guard a pending stream' unless direct&.match?(/scStream = stream\s+let started = try await TBCaptureStartup\.start.*?self\.scStream === stream.*?stream\.stopCapture/m)
+abort 'old auxiliary audio must not enter a replacement connection' unless direct&.match?(/delegate\.onAudio.*?self\.pipeline === pipeline.*?isCurrentCaptureAttempt.*?connection\.send/m)
+schedule = source[/private func scheduleCaptureRestart\(.*?(?=    private func softRestartCapture)/m]
+abort 'a cancelled watchdog must keep the current audio callbacks valid' unless schedule&.match?(/if onlyIfUnhealthy.*?return\s+\}.*?captureRestartGeneration &\+= 1/m)
 Dir.mktmpdir('tb-capture-startup.') do |dir|
   FileUtils.mkdir_p(File.join(dir, 'Sources/TargetBridge'))
   FileUtils.mkdir_p(File.join(dir, 'Tests/TargetBridgeTests'))

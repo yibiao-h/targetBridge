@@ -13,6 +13,12 @@ uses a 2240 × 1260 HiDPI desktop, and the 5K profile uses 2560 × 1440.
 The separate **iMac 4.5K** (`retina4_5k60`) preset uses the existing HEVC path;
 select **iMac 4.5K DPCM** to request 10-bit RGB capture.
 
+This integration is based on the 3.6.0 `main` release. It retains the mainline
+codec preferences, native-scale 1080p profiles, receiver identity migration and
+headless capture behavior. Render matching waits for the requested backing
+pixels and verifies the active mode, instead of accepting a 2240 × 1260 1x
+mode when a 4480 × 2520 HiDPI backing store is required.
+
 ## Capture and color contract
 
 The DPCM session explicitly requests `kCVPixelFormatType_ARGB2101010LEPacked`
@@ -125,6 +131,24 @@ not capture the screen or change display settings.
 Sender XCTest coverage checks capability combinations, the actual SCStream
 configuration, rejection of incompatible pixel buffers and CPU fallback
 round-trips of all 1024 channel values. See [Testing](Testing.md) for commands.
+
+For a stream stuck before its first HEVC frame, the Sender logs encoder creation,
+optional-property rejection, preparation and the first encoded packet. Receiver
+logs use `[video] stage=param_sets_received`, `param_sets_ready`, `encoded_packet`
+and `decoded_first_frame`, with bounded errors and a `session_end` summary.
+`make test-hevc-startup` exercises the real hardware encoder and FFmpeg decoder
+using synthetic 4.5K NV12/BGRA frames without capture or network access. Passing
+this on one GPU does not establish that a different receiver can decode the
+actual stream. The hardware-free diagnostic regression is
+`python3 tests/test_video_diagnostics.py` from `TargetBridge-Receiver/TBReceiverC`.
+
+DPCM reports mean encode-plus-packet time and packet size every 120 sent frames,
+alongside cumulative capture, pacing and pre-encode drop counters. The latter
+includes rejected frames as well as a full queue; correlate it with error logs. Use those
+to distinguish capture cadence, encoding work and a full send queue; a cable
+speed or FPS number alone does not identify the bottleneck. Packet construction
+copies the encoded bytes once into owned memory; subsequent GPU frames cannot
+overwrite packets still being sent. The 10-bit wire format remains unchanged.
 
 Before calling the path ready for general use, run real two-machine sessions
 on Apple Silicon and Intel receivers. Record source and receiver model, macOS

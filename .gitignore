@@ -25,5 +25,6 @@ test_receiver_profile
 test_dpcm
 test_dpcm_gpu
 test_dpcm_metal
+test_hevc_startup
 test_monitor_shield
 *.dSYM/

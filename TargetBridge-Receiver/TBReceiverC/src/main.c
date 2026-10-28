@@ -55,6 +55,15 @@
  * (5 missed heartbeats) means it died without a FIN. */
 #define TB_SENDER_IDLE_TIMEOUT_MS 10000
 
+struct tb_video_diagnostics {
+    uint64_t param_sets;
+    uint64_t encoded_packets;
+    uint64_t decoded_frames;
+    uint64_t param_errors;
+    uint64_t decode_errors;
+    int param_sets_ready;
+};
+
 struct app {
     struct tb_display *disp;
     struct tb_decoder *dec;
@@ -77,6 +86,7 @@ struct app {
     uint64_t last_recv_ms;      /* idle watchdog: last time the sender sent anything */
     int      close_requested;
     int      have_video_frame;
+    struct tb_video_diagnostics video_diagnostics;
     /* A real streaming session has begun (the sender sent a session packet, not
      * just a transient probe like a UI-language push). Gates the fullscreen
      * "connecting" splash so a bare/short-lived connection doesn't flash it. */
@@ -934,12 +944,72 @@ static void tb_receiver_apply_input_control_mode(struct app *a, const uint8_t *p
     tb_receiver_refresh_input_capture(a);
 }
 
+/* ---- Encoded video diagnostics --------------------------------------- */
+
+static void tb_video_diagnostics_reset(struct app *a) {
+    memset(&a->video_diagnostics, 0, sizeof(a->video_diagnostics));
+}
+
+static void tb_video_diagnostics_error(const char *stage, uint64_t *count, int status) {
+    ++*count;
+    if (*count <= 3) {
+        fprintf(stderr, "[video] stage=%s error=%d count=%llu%s\n", stage, status,
+                (unsigned long long)*count,
+                *count == 3 ? " (further errors suppressed until reconnect)" : "");
+    }
+}
+
+static void handle_encoded_param_sets(struct app *a, const uint8_t *payload, size_t len) {
+    struct tb_video_diagnostics *d = &a->video_diagnostics;
+    ++d->param_sets;
+    if (d->param_sets == 1) {
+        fprintf(stderr, "[video] stage=param_sets_received bytes=%zu codec=%u sets=%u\n",
+                len, len > 0 ? payload[0] : 0, len > 1 ? payload[1] : 0);
+    }
+    int status = tb_dec_set_param_sets(a->dec, payload, len);
+    if (status < 0) {
+        tb_video_diagnostics_error("param_sets", &d->param_errors, status);
+    } else if (!d->param_sets_ready) {
+        d->param_sets_ready = 1;
+        fprintf(stderr, "[video] stage=param_sets_ready\n");
+    }
+}
+
+static void handle_encoded_frame(struct app *a, const uint8_t *payload, size_t len) {
+    struct tb_video_diagnostics *d = &a->video_diagnostics;
+    ++d->encoded_packets;
+    if (d->encoded_packets == 1) {
+        fprintf(stderr, "[video] stage=encoded_packet bytes=%zu param_sets=%llu\n",
+                len, (unsigned long long)d->param_sets);
+    }
+    int status = tb_dec_feed_frame(a->dec, payload, len);
+    if (status < 0) tb_video_diagnostics_error("decode_packet", &d->decode_errors, status);
+}
+
+static void tb_video_diagnostics_decoded(struct app *a, int w, int h, int ys, int uvs) {
+    if (++a->video_diagnostics.decoded_frames == 1) {
+        fprintf(stderr, "[video] stage=decoded_first_frame size=%dx%d strides=%d/%d\n",
+                w, h, ys, uvs);
+    }
+}
+
+static void tb_video_diagnostics_finish(struct app *a) {
+    const struct tb_video_diagnostics *d = &a->video_diagnostics;
+    fprintf(stderr, "[video] stage=session_end param_sets=%llu encoded_packets=%llu "
+                    "decoded_frames=%llu param_errors=%llu decode_errors=%llu\n",
+            (unsigned long long)d->param_sets, (unsigned long long)d->encoded_packets,
+            (unsigned long long)d->decoded_frames, (unsigned long long)d->param_errors,
+            (unsigned long long)d->decode_errors);
+    tb_video_diagnostics_reset(a);
+}
+
 /* ---- Callbacks: decoder → display ------------------------------------ */
 
 static void on_frame(const uint8_t *y, int y_stride,
                      const uint8_t *uv, int uv_stride,
                      int w, int h, void *ud) {
     struct app *a = (struct app *)ud;
+    tb_video_diagnostics_decoded(a, w, h, y_stride, uv_stride);
     a->have_video_frame = 1;
     tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
     {
@@ -1203,11 +1273,11 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
         a->session_active = 1;
         /* tb_dec_set_param_sets is now a no-op if the sets are unchanged,
          * so we don't spam a log line per keyframe. */
-        tb_dec_set_param_sets(a->dec, payload, len);
+        handle_encoded_param_sets(a, payload, len);
         break;
     case TB_PKT_FRAME:
         a->session_active = 1;
-        tb_dec_feed_frame(a->dec, payload, len);
+        handle_encoded_frame(a, payload, len);
         break;
     case TB_PKT_RAW_FRAME:
         a->session_active = 1;
@@ -1934,6 +2004,7 @@ static void send_receiver_info(struct app *a) {
 }
 
 static void close_client(struct app *a) {
+    tb_video_diagnostics_finish(a);
     if (a->client_fd >= 0) close(a->client_fd);
     a->client_fd = -1;
     a->session_active = 0;
@@ -2168,6 +2239,7 @@ int main(int argc, char **argv) {
             int c = tb_net_accept(a.server_fd);
             if (c >= 0) {
                 a.client_fd = c;
+                tb_video_diagnostics_reset(&a);
                 a.have_video_frame = 0;
                 a.session_active = 0;
                 a.reported_night_shift = -1;   /* force one report per session */
