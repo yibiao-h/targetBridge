@@ -82,6 +82,15 @@ size_t tb_dpcm_gpu_encode(tb_dpcm_gpu *e,
                           int ten_bit, size_t header_reserve,
                           const uint8_t **out_blob);
 
+/* Opt-in adaptive RGB/green-difference coding. Each tile selects the smaller
+ * lossless representation; ties retain RGB. Requires receiver support for
+ * TB_DPCM_FLAG_ADAPTIVE_COLOR. Ownership, reserve and failure rules are the same
+ * as tb_dpcm_gpu_encode(); the legacy API keeps its original wire format. */
+size_t tb_dpcm_gpu_encode_adaptive(tb_dpcm_gpu *e,
+                                   const uint8_t *src, int stride, int w, int h,
+                                   int ten_bit, size_t header_reserve,
+                                   const uint8_t **out_blob);
+
 /* One encoded band, as returned by tb_dpcm_gpu_encode_bands(). Same ownership
  * rule as the single-frame call: the memory belongs to the encoder and stays
  * valid only until the next encode. */

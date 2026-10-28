@@ -52,6 +52,9 @@ struct TBMonitorDisplayProfile: Codable {
     /// receivers, which therefore keep receiving NV12 -- the gate is deliberately
     /// opt-in, because CPU decode is 166 ms/frame at 5K against 6.5 ms on the GPU.
     var supportsDPCM: Bool?
+    /// Optional TBD2 extension: per-tile reversible colour decorrelation.
+    /// Missing/false keeps legacy RGB tile coding for older receivers.
+    var supportsDPCMAdaptiveColor: Bool?
     var inputMonitoringTrusted: Bool?
     var accessibilityTrusted: Bool?
     /// Optional so older receivers still decode; absent means "cannot".

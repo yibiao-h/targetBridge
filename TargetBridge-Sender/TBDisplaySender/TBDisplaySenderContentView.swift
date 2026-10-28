@@ -201,6 +201,46 @@ struct TBDisplaySenderContentView: View {
     }
 }
 
+/// This view observes the once-per-window snapshot; no frame callback touches UI.
+private struct TBDPCMDiagnosticsView: View {
+    @ObservedObject var metrics: TBSessionLiveMetrics
+    let language: TBDisplaySenderLanguage
+
+    var body: some View {
+        if let dpcm = metrics.dpcm {
+            VStack(alignment: .leading, spacing: 8) {
+                row("capture", "\(dpcm.captureWidth) × \(dpcm.captureHeight) · l10r 10-bit")
+                row("frame_mb", format(dpcm.meanPacketMB))
+                row("compression", dpcm.compressionRatio.map { String(format: "%.2f:1", $0) } ?? "—")
+                row("submitted_gbps", format(dpcm.submittedGbps))
+                row("encode_ms", format(dpcm.meanEncodePacketMS))
+                row("backend", dpcm.usesGPU ? "GPU" : TBDisplaySenderL10n.text("sender.dpcm.cpu_fallback", language))
+                Text(TBDisplaySenderL10n.text("sender.dpcm.measurement_note", language))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func format(_ value: Double?) -> String {
+        value.map { String(format: "%.2f", $0) } ?? "—"
+    }
+
+    private func row(_ field: String, _ value: String) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            Text(TBDisplaySenderL10n.text("sender.dpcm.\(field)", language))
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 138, alignment: .leading)
+            Text(value)
+                .monospacedDigit()
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
 private struct TBDisplaySenderSessionCard: View {
     @ObservedObject var service: TBDisplaySenderService
     @ObservedObject var session: TBDisplaySenderSession
@@ -311,6 +351,7 @@ private struct TBDisplaySenderSessionCard: View {
                     infoRow(TBDisplaySenderL10n.virtualDisplayLabel(service.language), session.virtualDisplayText)
                     infoRow(TBDisplaySenderL10n.streamLabel(service.language), session.streamResolutionText)
                     infoRow(TBDisplaySenderL10n.fpsLabel(service.language), "\(session.senderFPS)")
+                    TBDPCMDiagnosticsView(metrics: session.liveMetrics, language: service.language)
                 }
             }
         }

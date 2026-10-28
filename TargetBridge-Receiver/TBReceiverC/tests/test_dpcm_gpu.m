@@ -163,12 +163,22 @@ static int check_submission_failures(tb_dpcm_gpu *encoder) {
             fprintf(stderr, "FAIL submission fault %d mutated failed band output\n", fault);
             ++failures;
         }
+        queue.phase = 0;
+        encoder->queue = (id<MTLCommandQueue>)queue;
+        blob = &sentinel;
+        const size_t adaptive_len = tb_dpcm_gpu_encode_adaptive(encoder,
+            (const uint8_t *)pixels, 32, 8, 8, 1, 0, &blob);
+        encoder->queue = real;
+        if (adaptive_len != 0 || blob != &sentinel) {
+            fprintf(stderr, "FAIL submission fault %d mutated failed adaptive output\n", fault);
+            ++failures;
+        }
     }
     return failures;
 }
 
 static int check_frame(tb_dpcm_gpu *encoder, int w, int h, int ten_bit,
-                       int pattern, int unaligned) {
+                       int pattern, int unaligned, int adaptive) {
     const int stride = (w * 4 + 63) & ~63;
     const size_t bytes = (size_t)stride * h;
     const size_t page = (size_t)getpagesize();
@@ -186,9 +196,19 @@ static int check_frame(tb_dpcm_gpu *encoder, int w, int h, int ten_bit,
             uint32_t g = pattern == 0 ? 65u : mask - ((uint32_t)x & mask);
             uint32_t r = pattern == 0 ? 3u : (uint32_t)x * 5u + (uint32_t)y;
             if (pattern == 2) { b = rng; g = rng >> 7; r = rng >> 13; }
+            if (pattern == 3 || (pattern == 4 && ((x / 8 + y / 8) & 1) == 0))
+                b = g = r = ((uint32_t)x * 13u + (uint32_t)y * 7u) & mask;
+            if (pattern == 5 || (pattern == 4 && ((x / 8 + y / 8) & 1) != 0)) {
+                g = ((uint32_t)x + (uint32_t)y) & mask;
+                b = r = mask - g;
+            }
+            /* Alpha is omitted. Vary it in mixed-domain frames so an input
+             * alpha bit cannot accidentally become the tile's domain marker. */
+            const uint32_t alpha = pattern == 4 ? (rng & (ten_bit ? 3u : 255u))
+                                                : (ten_bit ? 3u : 255u);
             const uint32_t pixel = ten_bit
-                ? (3u << 30) | ((r & mask) << 20) | ((g & mask) << 10) | (b & mask)
-                : (255u << 24) | ((r & mask) << 16) | ((g & mask) << 8) | (b & mask);
+                ? (alpha << 30) | ((r & mask) << 20) | ((g & mask) << 10) | (b & mask)
+                : (alpha << 24) | ((r & mask) << 16) | ((g & mask) << 8) | (b & mask);
             memcpy(src + (size_t)y * stride + (size_t)x * 4, &pixel, 4);
         }
     }
@@ -197,21 +217,53 @@ static int check_frame(tb_dpcm_gpu *encoder, int w, int h, int ten_bit,
     uint8_t *decoded = calloc(1, bytes);
     int failed = 1;
     if (reference && decoded) {
-        const size_t cpu_len = tb_dpcm_encode(src, stride, w, h, ten_bit,
-                                             reference, capacity);
+        const size_t legacy_len = tb_dpcm_encode(src, stride, w, h, ten_bit,
+                                                reference, capacity);
+        const size_t cpu_len = adaptive
+            ? tb_dpcm_encode_adaptive(src, stride, w, h, ten_bit, reference, capacity)
+            : legacy_len;
         const uint8_t *gpu_blob = NULL;
-        const size_t gpu_len = tb_dpcm_gpu_encode(encoder, src, stride, w, h,
-                                                  ten_bit, 0, &gpu_blob);
-        failed = !cpu_len || !gpu_blob || gpu_len != cpu_len;
+        const size_t reserve = adaptive && unaligned ? 5 : 0;
+        const size_t returned_len = adaptive
+            ? tb_dpcm_gpu_encode_adaptive(encoder, src, stride, w, h, ten_bit, reserve, &gpu_blob)
+            : tb_dpcm_gpu_encode(encoder, src, stride, w, h, ten_bit, reserve, &gpu_blob);
+        failed = !cpu_len || !gpu_blob || returned_len != cpu_len + reserve;
+        const size_t gpu_len = returned_len >= reserve ? returned_len - reserve : 0;
+        if (!failed && reserve) {
+            memset((uint8_t *)gpu_blob, 0xA5, reserve);
+            gpu_blob += reserve;
+        }
+        if (!failed) failed = gpu_len > legacy_len;
         if (!failed) failed = memcmp(reference, gpu_blob, cpu_len) != 0;
+        struct tb_dpcm_info info;
+        if (!failed) failed = tb_dpcm_parse(gpu_blob, gpu_len, &info) != 0;
+        if (!failed) failed = info.adaptive_color != adaptive;
+        if (!failed && adaptive) {
+            unsigned green_tiles = 0;
+            for (uint32_t t = 0; t < info.tile_count; ++t) {
+                uint32_t seed;
+                memcpy(&seed, gpu_blob + info.seed_plane_off + (size_t)t * 4, 4);
+                green_tiles += (seed & TB_DPCM_SEED_ADAPTIVE_COLOR) != 0;
+            }
+            if ((pattern == 0 || pattern == 5) && green_tiles != 0) failed = 1;
+            if (pattern == 4 && w >= 16 && h >= 8 &&
+                (green_tiles == 0 || green_tiles == info.tile_count)) failed = 1;
+            if (pattern == 3 && w * h >= 4096 && gpu_len * 2 >= legacy_len) failed = 1;
+        }
         if (!failed) failed = tb_dpcm_decode(gpu_blob, gpu_len, decoded, stride) != 0;
-        for (int y = 0; !failed && y < h; ++y)
-            failed = memcmp(src + (size_t)y * stride,
-                            decoded + (size_t)y * stride, (size_t)w * 4) != 0;
+        const uint32_t alpha_mask = ten_bit ? (3u << 30) : (255u << 24);
+        for (int y = 0; !failed && y < h; ++y) {
+            for (int x = 0; !failed && x < w; ++x) {
+                uint32_t want, got;
+                memcpy(&want, src + (size_t)y * stride + (size_t)x * 4, 4);
+                memcpy(&got, decoded + (size_t)y * stride + (size_t)x * 4, 4);
+                failed = got != (want | alpha_mask);
+            }
+        }
     }
     if (failed)
-        fprintf(stderr, "FAIL GPU parity %dx%d %d-bit pattern=%d unaligned=%d\n",
-                w, h, ten_bit ? 10 : 8, pattern, unaligned);
+        fprintf(stderr, "FAIL GPU parity %dx%d %d-bit pattern=%d unaligned=%d adaptive=%d\n",
+                w, h, ten_bit ? 10 : 8, pattern, unaligned, adaptive);
     free(decoded); free(reference); free(storage);
     return failed;
 }
@@ -238,12 +290,25 @@ int main(void) {
                 for (int pattern = 0; pattern < 3; ++pattern)
                     for (int unaligned = 0; unaligned <= 1; ++unaligned) {
                         failures += check_frame(encoder, sizes[i][0], sizes[i][1],
-                                                ten, pattern, unaligned);
+                                                ten, pattern, unaligned, 0);
                         ++checks;
                     }
         // Native M1 iMac resolution leaves 16 tiles in the last 64-tile group.
         for (int pattern = 0; pattern < 3; ++pattern) {
-            failures += check_frame(encoder, 4480, 2520, 1, pattern, 0);
+            failures += check_frame(encoder, 4480, 2520, 1, pattern, 0, 0);
+            ++checks;
+        }
+        const int adaptive_sizes[][2] = {{1,1}, {7,5}, {8,8}, {16,8}, {65,17}, {1024,9}};
+        for (int ten = 0; ten <= 1; ++ten)
+            for (size_t i = 0; i < sizeof(adaptive_sizes) / sizeof(adaptive_sizes[0]); ++i)
+                for (int pattern = 0; pattern < 6; ++pattern)
+                    for (int unaligned = 0; unaligned <= 1; ++unaligned) {
+                        failures += check_frame(encoder, adaptive_sizes[i][0], adaptive_sizes[i][1],
+                                                ten, pattern, unaligned, 1);
+                        ++checks;
+                    }
+        for (int pattern = 2; pattern <= 4; ++pattern) {
+            failures += check_frame(encoder, 4480, 2520, 1, pattern, 0, 1);
             ++checks;
         }
         tb_dpcm_gpu_destroy(encoder);

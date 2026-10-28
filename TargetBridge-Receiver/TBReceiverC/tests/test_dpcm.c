@@ -374,6 +374,46 @@ static void test_encode_respects_capacity(void) {
     free(dst); free(f);
 }
 
+/* Dense antialiased grayscale has three identical residual streams. The
+ * negotiated adaptive format must avoid paying for all three, without losing
+ * low bits or making unrelated colour/noise tiles larger than legacy TBD2. */
+static void test_adaptive_color(int ten_bit) {
+    const int sizes[][2] = {{1, 1}, {7, 9}, {129, 67}};
+    const uint32_t mask = ten_bit ? 1023u : 255u;
+    for (size_t s = 0; s < sizeof(sizes) / sizeof(sizes[0]); ++s) {
+        const int w = sizes[s][0], h = sizes[s][1], stride = w * 4 + 3;
+        const size_t cap = tb_dpcm_max_size(w, h);
+        uint8_t *src = calloc(h, stride), *back = malloc((size_t)h * stride);
+        uint8_t *legacy = malloc(cap), *adaptive = malloc(cap);
+        for (int pattern = 0; pattern < 5; ++pattern) {
+            for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
+                uint32_t v = (uint32_t)(x * 73 + y * 101) & mask;
+                uint32_t b = v, g = v, r = v;
+                if (pattern == 1) { b = 0; r = mask; } // green varies alone
+                if (pattern == 2 || (pattern == 3 && ((x / 8) & 1))) {
+                    b = rng() & mask; g = rng() & mask; r = rng() & mask;
+                }
+                if (pattern == 4) { b = v; g = (v + 511) & mask; r = (v + 1021) & mask; }
+                const uint32_t px = pack_px(b, g, r, ten_bit);
+                memcpy(src + (size_t)y * stride + x * 4, &px, 4);
+            }
+            const size_t old_len = tb_dpcm_encode(src, stride, w, h, ten_bit, legacy, cap);
+            const size_t len = tb_dpcm_encode_adaptive(src, stride, w, h, ten_bit, adaptive, cap);
+            CHECK(len > 0 && len <= old_len, "adaptive payload never exceeds legacy");
+            struct tb_dpcm_info info;
+            CHECK(tb_dpcm_parse(adaptive, len, &info) == 0 && info.adaptive_color,
+                  "adaptive frame declares the negotiated extension");
+            CHECK(!(legacy[14] & TB_DPCM_FLAG_ADAPTIVE_COLOR), "legacy encoder never opts in");
+            if (pattern == 0 && w > 8)
+                CHECK(len * 2 < old_len, "dense grayscale saves over half the payload");
+            memset(back, 0, (size_t)h * stride);
+            CHECK(tb_dpcm_decode(adaptive, len, back, stride) == 0, "adaptive decode succeeds");
+            CHECK(memcmp(src, back, (size_t)h * stride) == 0, "adaptive preserves all RGB bits and row padding");
+        }
+        free(adaptive); free(legacy); free(back); free(src);
+    }
+}
+
 int main(void) {
     for (int ten_bit = 0; ten_bit <= 1; ++ten_bit) {
         printf("--- %d-bit ---\n", ten_bit ? 10 : 8);
@@ -383,6 +423,7 @@ int main(void) {
         test_wraparound(ten_bit);
         test_partial_tiles(ten_bit);
         test_mixed_widths(ten_bit);
+        test_adaptive_color(ten_bit);
     }
     test_depths_are_distinct();
     test_all_ten_bit_levels();

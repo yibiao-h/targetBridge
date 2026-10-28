@@ -126,6 +126,7 @@ final class TBDPCMTransportTests: XCTestCase {
 
     func testCPUOwnedPacketsRetainTenBitPixelsAcrossEncoderReuseAndDestruction() throws {
         try assertOwnedPacketsSurviveReuse(useGPU: false)
+        try assertOwnedPacketsSurviveReuse(useGPU: false, adaptiveColor: true)
     }
 
     func testGPUOwnedPacketsRetainTenBitPixelsAcrossEncoderReuseAndDestruction() throws {
@@ -134,13 +135,41 @@ final class TBDPCMTransportTests: XCTestCase {
         }
         tb_dpcm_gpu_destroy(probe)
         try assertOwnedPacketsSurviveReuse(useGPU: true)
+        try assertOwnedPacketsSurviveReuse(useGPU: true, adaptiveColor: true)
     }
 
-    private func assertOwnedPacketsSurviveReuse(useGPU: Bool) throws {
+    func testAdaptiveDPCMReducesCorrelatedRGBWithoutDroppingAnyTenBitLevel() throws {
+        let width = 1024, height = 8
+        let pixelBuffer = try buffer(format: kCVPixelFormatType_ARGB2101010LEPacked,
+                                     width: width, height: height)
+        XCTAssertEqual(CVPixelBufferLockBaseAddress(pixelBuffer, []), kCVReturnSuccess)
+        let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(pixelBuffer))
+        let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        var pixels = Data()
+        for y in 0..<height {
+            let row = base.advanced(by: y * stride).assumingMemoryBound(to: UInt32.self)
+            for x in 0..<width {
+                let level = UInt32((x * 137 + y) & 1023)
+                row[x] = (3 << 30) | (level << 20) | (level << 10) | level
+            }
+            pixels.append(base.advanced(by: y * stride).assumingMemoryBound(to: UInt8.self), count: width * 4)
+        }
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+        for useGPU in [false, true] {
+            let legacy = try XCTUnwrap(TBDPCMFrameEncoder(useGPU: useGPU).encodePacket(pixelBuffer))
+            let adaptive = try XCTUnwrap(TBDPCMFrameEncoder(useGPU: useGPU, adaptiveColor: true).encodePacket(pixelBuffer))
+            XCTAssertEqual(legacy[5 + 14] & UInt8(TB_DPCM_FLAG_ADAPTIVE_COLOR), 0)
+            XCTAssertNotEqual(adaptive[5 + 14] & UInt8(TB_DPCM_FLAG_ADAPTIVE_COLOR), 0)
+            XCTAssertLessThan(adaptive.count * 2, legacy.count)
+            try assertPacket(adaptive, decodesTo: pixels, width: width, height: height)
+        }
+    }
+
+    private func assertOwnedPacketsSurviveReuse(useGPU: Bool, adaptiveColor: Bool = false) throws {
         let width = 1024, height = 3
         let pixelBuffer = try buffer(format: kCVPixelFormatType_ARGB2101010LEPacked,
                                      width: width, height: height)
-        var encoder: TBDPCMFrameEncoder? = TBDPCMFrameEncoder(useGPU: useGPU)
+        var encoder: TBDPCMFrameEncoder? = TBDPCMFrameEncoder(useGPU: useGPU, adaptiveColor: adaptiveColor)
         var retained: [(packet: Data, pixels: Data)] = []
         for frame in 0..<8 {
             XCTAssertEqual(CVPixelBufferLockBaseAddress(pixelBuffer, []), kCVReturnSuccess)
@@ -190,6 +219,106 @@ final class TBDPCMTransportTests: XCTestCase {
             }
         }
         XCTAssertEqual(decoded, pixels)
+    }
+}
+
+final class TBVideoSubmissionStatisticsTests: XCTestCase {
+    private func frame(width: Int = 4480, height: Int = 2520,
+                       seconds: Double = 0.012, usesGPU: Bool = true) -> TBVideoSubmissionStatistics.DPCMFrame {
+        .init(width: width, height: height, encodePacketSeconds: seconds, usesGPU: usesGPU)
+    }
+
+    func testDelayedTimerUsesOneElapsedWindowForFPSAndVideoTraffic() throws {
+        var statistics = TBVideoSubmissionStatistics()
+        let before = statistics.snapshot(at: 10)
+        for _ in 0..<60 { statistics.record(packetBytes: 50_000_000, dpcm: frame()) }
+        let rate = TBVideoSubmissionStatistics.rate(from: before, to: statistics.snapshot(at: 12))
+        XCTAssertEqual(rate.framesPerSecond, 30, accuracy: 0.0001)
+        let dpcm = try XCTUnwrap(rate.dpcm)
+        XCTAssertEqual(dpcm.submittedGbps, 12, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(dpcm.meanPacketMB), 50, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(dpcm.compressionRatio), Double(4480 * 2520 * 4) / 50_000_000, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(dpcm.meanEncodePacketMS), 12, accuracy: 0.0001)
+    }
+
+    func testNextWindowExcludesEarlierPacketsAndUsesActualCaptureSize() throws {
+        var statistics = TBVideoSubmissionStatistics()
+        statistics.record(packetBytes: 50_000_000, dpcm: frame())
+        let before = statistics.snapshot(at: 20)
+        for _ in 0..<15 {
+            statistics.record(packetBytes: 4_000_000, dpcm: frame(width: 1920, height: 1080, seconds: 0.005))
+        }
+        let rate = TBVideoSubmissionStatistics.rate(from: before, to: statistics.snapshot(at: 20.5))
+        XCTAssertEqual(rate.framesPerSecond, 30, accuracy: 0.0001)
+        let dpcm = try XCTUnwrap(rate.dpcm)
+        XCTAssertEqual(dpcm.captureWidth, 1920)
+        XCTAssertEqual(dpcm.captureHeight, 1080)
+        XCTAssertEqual(dpcm.submittedGbps, 0.96, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(dpcm.meanPacketMB), 4, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(dpcm.compressionRatio), Double(1920 * 1080 * 4) / 4_000_000, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(dpcm.meanEncodePacketMS), 5, accuracy: 0.0001)
+    }
+
+    func testIdleWindowReportsZeroTrafficWithoutStaleAverages() throws {
+        var statistics = TBVideoSubmissionStatistics()
+        statistics.record(packetBytes: 10_000_000, dpcm: frame())
+        let before = statistics.snapshot(at: 1)
+        let rate = TBVideoSubmissionStatistics.rate(from: before, to: statistics.snapshot(at: 2))
+        XCTAssertEqual(rate.framesPerSecond, 0)
+        let dpcm = try XCTUnwrap(rate.dpcm)
+        XCTAssertEqual(dpcm.submittedGbps, 0)
+        XCTAssertEqual(dpcm.captureWidth, 4480)
+        XCTAssertNil(dpcm.meanPacketMB)
+        XCTAssertNil(dpcm.compressionRatio)
+        XCTAssertNil(dpcm.meanEncodePacketMS)
+    }
+
+    func testNewPipelineAndInvalidTimeDoNotReusePreviousRates() {
+        var old = TBVideoSubmissionStatistics()
+        old.record(packetBytes: 10_000_000, dpcm: frame())
+        let oldSnapshot = old.snapshot(at: 10)
+        let fresh = TBVideoSubmissionStatistics()
+        let restarted = TBVideoSubmissionStatistics.rate(from: oldSnapshot, to: fresh.snapshot(at: 11))
+        XCTAssertEqual(restarted.framesPerSecond, 0)
+        XCTAssertNil(restarted.dpcm)
+        for time in [10.0, 9.0] {
+            let rate = TBVideoSubmissionStatistics.rate(from: oldSnapshot, to: old.snapshot(at: time))
+            XCTAssertEqual(rate.framesPerSecond, 0)
+            XCTAssertNil(rate.dpcm)
+        }
+    }
+
+    func testFallbackBackendTracksTheEncoderThatProducedTheLatestFrame() throws {
+        var statistics = TBVideoSubmissionStatistics()
+        let before = statistics.snapshot(at: 1)
+        statistics.record(packetBytes: 10_000_000, dpcm: frame(usesGPU: true))
+        let gpu = statistics.snapshot(at: 2)
+        XCTAssertTrue(try XCTUnwrap(TBVideoSubmissionStatistics.rate(from: before, to: gpu).dpcm).usesGPU)
+        statistics.record(packetBytes: 10_000_000, dpcm: frame(usesGPU: false))
+        let cpu = statistics.snapshot(at: 3)
+        XCTAssertFalse(try XCTUnwrap(TBVideoSubmissionStatistics.rate(from: gpu, to: cpu).dpcm).usesGPU)
+    }
+
+    func testEncodedVideoStillReportsFPSWithoutDPCMDetails() {
+        var statistics = TBVideoSubmissionStatistics()
+        let before = statistics.snapshot(at: 5)
+        for _ in 0..<24 { statistics.record(packetBytes: 100_000) }
+        let rate = TBVideoSubmissionStatistics.rate(from: before, to: statistics.snapshot(at: 5.5))
+        XCTAssertEqual(rate.framesPerSecond, 48, accuracy: 0.0001)
+        XCTAssertNil(rate.dpcm)
+    }
+
+    @MainActor
+    func testStoppingLiveMetricsClearsDPCMAndFPS() {
+        let metrics = TBSessionLiveMetrics()
+        var statistics = TBVideoSubmissionStatistics()
+        let before = statistics.snapshot(at: 1)
+        statistics.record(packetBytes: 10_000_000, dpcm: frame())
+        metrics.senderFPS = 30
+        metrics.dpcm = TBVideoSubmissionStatistics.rate(from: before, to: statistics.snapshot(at: 2)).dpcm
+        metrics.reset()
+        XCTAssertEqual(metrics.senderFPS, 0)
+        XCTAssertNil(metrics.dpcm)
     }
 }
 

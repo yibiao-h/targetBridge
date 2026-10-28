@@ -11,6 +11,93 @@ import Network
 @preconcurrency import ScreenCaptureKit
 import VideoToolbox
 
+/// Counts only video packets submitted by this pipeline. Audio, control traffic,
+/// TCP overhead and retransmissions are deliberately outside this measurement.
+struct TBVideoSubmissionStatistics {
+    struct DPCMFrame {
+        let width: Int
+        let height: Int
+        let encodePacketSeconds: Double
+        let usesGPU: Bool
+    }
+
+    struct Snapshot {
+        var timestamp: Double = 0
+        var frames: Int64 = 0
+        var packetBytes: Int64 = 0
+        var dpcmFrames: Int64 = 0
+        var dpcmPacketBytes: Int64 = 0
+        var packedBytes: Int64 = 0
+        var encodePacketSeconds: Double = 0
+        var captureWidth = 0
+        var captureHeight = 0
+        var usesGPU = false
+    }
+
+    struct DPCMRate: Equatable {
+        let captureWidth: Int
+        let captureHeight: Int
+        let meanPacketMB: Double?
+        /// Packed 32bpp bytes divided by complete submitted packet bytes.
+        let compressionRatio: Double?
+        let submittedGbps: Double
+        let meanEncodePacketMS: Double?
+        let usesGPU: Bool
+    }
+
+    struct Rate {
+        var framesPerSecond: Double = 0
+        var dpcm: DPCMRate?
+    }
+
+    private var totals = Snapshot()
+    var totalFrames: Int { Int(totals.frames) }
+
+    mutating func record(packetBytes: Int, dpcm: DPCMFrame? = nil) {
+        guard packetBytes > 0 else { return }
+        totals.frames += 1
+        totals.packetBytes += Int64(packetBytes)
+        guard let dpcm else { return }
+        totals.dpcmFrames += 1
+        totals.dpcmPacketBytes += Int64(packetBytes)
+        totals.packedBytes += Int64(dpcm.width) * Int64(dpcm.height) * 4
+        totals.encodePacketSeconds += max(0, dpcm.encodePacketSeconds)
+        totals.captureWidth = dpcm.width
+        totals.captureHeight = dpcm.height
+        totals.usesGPU = dpcm.usesGPU
+    }
+
+    func snapshot(at timestamp: Double) -> Snapshot {
+        var snapshot = totals
+        snapshot.timestamp = timestamp
+        return snapshot
+    }
+
+    static func rate(from previous: Snapshot, to current: Snapshot) -> Rate {
+        let elapsed = current.timestamp - previous.timestamp
+        guard elapsed.isFinite, elapsed > 0,
+              current.frames >= previous.frames,
+              current.packetBytes >= previous.packetBytes,
+              current.dpcmFrames >= previous.dpcmFrames,
+              current.dpcmPacketBytes >= previous.dpcmPacketBytes,
+              current.packedBytes >= previous.packedBytes else { return Rate() }
+        var rate = Rate(framesPerSecond: Double(current.frames - previous.frames) / elapsed)
+        guard current.dpcmFrames > 0 else { return rate }
+        let frames = Double(current.dpcmFrames - previous.dpcmFrames)
+        let bytes = Double(current.dpcmPacketBytes - previous.dpcmPacketBytes)
+        let rawBytes = Double(current.packedBytes - previous.packedBytes)
+        let encodeSeconds = max(0, current.encodePacketSeconds - previous.encodePacketSeconds)
+        rate.dpcm = DPCMRate(
+            captureWidth: current.captureWidth, captureHeight: current.captureHeight,
+            meanPacketMB: frames > 0 ? bytes / frames / 1_000_000 : nil,
+            compressionRatio: bytes > 0 ? rawBytes / bytes : nil,
+            submittedGbps: bytes * 8 / elapsed / 1_000_000_000,
+            meanEncodePacketMS: frames > 0 ? encodeSeconds * 1000 / frames : nil,
+            usesGPU: current.usesGPU)
+        return rate
+    }
+}
+
 /// Reserve network capacity before encoding. Once encoded, even a non-keyframe
 /// may be a reference for subsequent frames and must not be discarded locally.
 enum TBVideoQueueBudget {
@@ -468,9 +555,12 @@ enum TBCaptureStartup {
 final class TBDPCMFrameEncoder {
     private var gpu: OpaquePointer?
     private var cpuBuffer = Data()
+    private let adaptiveColor: Bool
+    var usesGPU: Bool { gpu != nil }
 
-    init(useGPU: Bool = true) {
+    init(useGPU: Bool = true, adaptiveColor: Bool = false) {
         gpu = useGPU ? tb_dpcm_gpu_create() : nil
+        self.adaptiveColor = adaptiveColor
     }
 
     deinit {
@@ -506,7 +596,9 @@ final class TBDPCMFrameEncoder {
 
         if let gpu {
             var blob: UnsafePointer<UInt8>?
-            let count = tb_dpcm_gpu_encode(gpu, base, Int32(stride), Int32(width), Int32(height), 1, 0, &blob)
+            let count = adaptiveColor
+                ? tb_dpcm_gpu_encode_adaptive(gpu, base, Int32(stride), Int32(width), Int32(height), 1, 0, &blob)
+                : tb_dpcm_gpu_encode(gpu, base, Int32(stride), Int32(width), Int32(height), 1, 0, &blob)
             if count > 0, count < Int(TBMonitorProtocol.maxPacketLength), let blob {
                 return makeOwnedData(UnsafeBufferPointer(start: blob, count: count))
             }
@@ -520,8 +612,12 @@ final class TBDPCMFrameEncoder {
             cpuBuffer = Data(count: capacity)
         }
         let count = cpuBuffer.withUnsafeMutableBytes { output in
-            tb_dpcm_encode(base, Int32(stride), Int32(width), Int32(height), 1,
-                           output.bindMemory(to: UInt8.self).baseAddress, capacity)
+            if adaptiveColor {
+                return tb_dpcm_encode_adaptive(base, Int32(stride), Int32(width), Int32(height), 1,
+                                               output.bindMemory(to: UInt8.self).baseAddress, capacity)
+            }
+            return tb_dpcm_encode(base, Int32(stride), Int32(width), Int32(height), 1,
+                                  output.bindMemory(to: UInt8.self).baseAddress, capacity)
         }
         guard count > 0 else { return nil }
         return cpuBuffer.withUnsafeBytes { output in
@@ -715,8 +811,8 @@ private final class TBDirectDisplayStreamCapture {
 /// Owns the capture→encode→send video pipeline and runs it entirely on a
 /// dedicated serial queue, off the main thread. SwiftUI layout (or any other
 /// main-thread work) therefore cannot stall frame delivery. All mutable encode
-/// state is confined to `queue`; the two values the main thread polls
-/// (`sentFrames`, capture health) are guarded by a small lock instead of
+/// state is confined to `queue`; the video totals and capture health polled
+/// from the main thread are guarded by a small lock instead of
 /// a per-frame hop back to main.
 private final class TBVideoPipeline: @unchecked Sendable {
     let queue = DispatchQueue(label: "fd.tbmonitor.sender.pipeline", qos: .userInteractive)
@@ -747,7 +843,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
 
     // Read from the main thread (fps timer / watchdog); guarded by `lock`.
     private let lock = NSLock()
-    private var _sentFrames = 0
+    private var submissionStatistics = TBVideoSubmissionStatistics()
     private var capturedFrames = 0
     private var droppedByFrameRatePacer = 0
     private var droppedBeforeEncodeFrames = 0
@@ -761,6 +857,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
          displayID: CGDirectDisplayID,
          usesRawNV12: Bool,
          dpcmEnabled: Bool,
+         dpcmAdaptiveColorEnabled: Bool = false,
          ackAlreadySent: Bool,
          onFirstFrame: @escaping @Sendable () -> Void) {
         self.preset = preset
@@ -770,6 +867,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         self.displayID = displayID
         self.usesRawNV12 = usesRawNV12
         self.dpcmEnabled = dpcmEnabled
+        self.dpcmAdaptiveColorEnabled = dpcmAdaptiveColorEnabled
         self.frameRatePacer = TBFrameRatePacer(maximumFrameRate: preset.expectedFrameRate)
         self.ackSent = ackAlreadySent
         self.onFirstFrame = onFirstFrame
@@ -811,7 +909,17 @@ private final class TBVideoPipeline: @unchecked Sendable {
 
     var sentFramesSnapshot: Int {
         lock.lock(); defer { lock.unlock() }
-        return _sentFrames
+        return submissionStatistics.totalFrames
+    }
+
+    var submissionSnapshot: TBVideoSubmissionStatistics.Snapshot {
+        lock.lock(); defer { lock.unlock() }
+        return submissionStatistics.snapshot(at: ProcessInfo.processInfo.systemUptime)
+    }
+
+    private func recordVideoSubmission(packetBytes: Int, dpcm: TBVideoSubmissionStatistics.DPCMFrame? = nil) {
+        lock.lock(); defer { lock.unlock() }
+        submissionStatistics.record(packetBytes: packetBytes, dpcm: dpcm)
     }
 
     var captureHealthSnapshot: TBCaptureHealth {
@@ -1085,11 +1193,12 @@ private final class TBVideoPipeline: @unchecked Sendable {
                     self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
                 }
             }))
-            lock.lock(); _sentFrames += 1; lock.unlock()
+            recordVideoSubmission(packetBytes: packet.count)
         }
     }
 
     private let dpcmEnabled: Bool
+    private let dpcmAdaptiveColorEnabled: Bool
     private var dpcmEncoder: TBDPCMFrameEncoder?
     private var loggedInvalidDPCMFrame = false
     private var loggedDPCMFormat = false
@@ -1113,7 +1222,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
             droppedBeforeEncodeFrames += 1
             return
         }
-        if dpcmEncoder == nil { dpcmEncoder = TBDPCMFrameEncoder() }
+        if dpcmEncoder == nil {
+            dpcmEncoder = TBDPCMFrameEncoder(adaptiveColor: dpcmAdaptiveColorEnabled)
+        }
         let encodeStarted = ProcessInfo.processInfo.systemUptime
         guard let packet = dpcmEncoder?.encodePacket(pixelBuffer) else {
             droppedBeforeEncodeFrames += 1
@@ -1123,14 +1234,15 @@ private final class TBVideoPipeline: @unchecked Sendable {
             }
             return
         }
+        let encodePacketSeconds = ProcessInfo.processInfo.systemUptime - encodeStarted
         if !loggedDPCMFormat {
             loggedDPCMFormat = true
-            TBLog.connection.info("dpcm: captured l10r RGB 10-bit, Display P3 requested, width=\(CVPixelBufferGetWidth(pixelBuffer)) height=\(CVPixelBufferGetHeight(pixelBuffer))")
+            TBLog.connection.info("dpcm: captured l10r RGB 10-bit, Display P3 requested, width=\(CVPixelBufferGetWidth(pixelBuffer)) height=\(CVPixelBufferGetHeight(pixelBuffer)) adaptiveColor=\(self.dpcmAdaptiveColorEnabled)")
         }
         acknowledgeFirstFrame()
         dpcmMeasuredFrames += 1
         dpcmMeasuredBytes += packet.count
-        dpcmMeasuredSeconds += ProcessInfo.processInfo.systemUptime - encodeStarted
+        dpcmMeasuredSeconds += encodePacketSeconds
         if dpcmMeasuredFrames == 120 {
             let meanMS = dpcmMeasuredSeconds * 1000 / Double(dpcmMeasuredFrames)
             let meanBytes = dpcmMeasuredBytes / dpcmMeasuredFrames
@@ -1146,7 +1258,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
             }
         }))
-        lock.lock(); _sentFrames += 1; lock.unlock()
+        recordVideoSubmission(packetBytes: packet.count, dpcm: .init(
+            width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer),
+            encodePacketSeconds: encodePacketSeconds, usesGPU: dpcmEncoder?.usesGPU ?? false))
     }
 
     /// Legacy NV12 passthrough, negotiated before configuring capture.
@@ -1207,7 +1321,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
             }
         }))
-        lock.lock(); _sentFrames += 1; lock.unlock()
+        recordVideoSubmission(packetBytes: packet.count)
     }
 
     private func buildParamSetsPacket(from format: CMVideoFormatDescription, codecType: CMVideoCodecType) -> Data? {
@@ -1294,12 +1408,17 @@ private final class TBVideoPipeline: @unchecked Sendable {
     }
 }
 
-/// Live, frequently-updating session readouts (currently just the FPS counter),
-/// split out of `TBDisplaySenderSession` so their ~1 Hz changes only invalidate
-/// the small subview that displays them rather than the whole session card.
+/// Live session readouts sampled about once a second. DPCM details observe this
+/// object directly instead of adding more published fields to the session.
 @MainActor
 final class TBSessionLiveMetrics: ObservableObject {
     @Published var senderFPS = 0
+    @Published var dpcm: TBVideoSubmissionStatistics.DPCMRate?
+
+    func reset() {
+        senderFPS = 0
+        dpcm = nil
+    }
 }
 
 @MainActor
@@ -1627,7 +1746,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private var directDisplayStream: TBDirectDisplayStreamCapture?
     private var pipeline: TBVideoPipeline?
 
-    private var sentSnapshot = 0
+    private var lastSubmissionSnapshot: TBVideoSubmissionStatistics.Snapshot?
     private var sessionAckSent = false
     private var captureBlockedByScreenRecordingPermission = false
     private var fpsTimer: Timer?
@@ -2195,8 +2314,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             setStatus(status)
         }
         refreshLocalizedText()
-        liveMetrics.senderFPS = 0
-        sentSnapshot = 0
+        liveMetrics.reset()
+        senderFPS = 0
+        lastSubmissionSnapshot = nil
         sessionAckSent = false
         baselineDisplayIDs = []
         headlessMirrorUsesVirtualDisplay = false
@@ -3104,6 +3224,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 displayID: session.displayID,
                 usesRawNV12: usesRawNV12,
                 dpcmEnabled: transport == .dpcm10Bit,
+                dpcmAdaptiveColorEnabled: transport == .dpcm10Bit && profile.supportsDPCMAdaptiveColor == true,
                 ackAlreadySent: sessionAckSent,
                 onFirstFrame: { [weak self] in
                     Task { @MainActor in
@@ -4116,9 +4237,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         pipeline?.stop()
         pipeline = nil
         isStreaming = false
-        liveMetrics.senderFPS = 0
+        liveMetrics.reset()
         senderFPS = 0
-        sentSnapshot = 0
+        lastSubmissionSnapshot = nil
         cursorDisplayID = kCGNullDirectDisplay
         lastCursorPacket = nil
 
@@ -4142,15 +4263,21 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
     private func startFPSTimer() {
         fpsTimer?.invalidate()
-        sentSnapshot = pipeline?.sentFramesSnapshot ?? 0
-        fpsTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            guard let self else { return }
+        liveMetrics.reset()
+        senderFPS = 0
+        guard let pipeline else { lastSubmissionSnapshot = nil; return }
+        lastSubmissionSnapshot = pipeline.submissionSnapshot
+        fpsTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self, weak pipeline] _ in
+            guard let self, let pipeline else { return }
             MainActor.assumeIsolated {
-                let total = pipeline?.sentFramesSnapshot ?? 0
-                let fps = total - sentSnapshot
+                guard self.pipeline === pipeline, let previous = lastSubmissionSnapshot else { return }
+                let current = pipeline.submissionSnapshot
+                let rate = TBVideoSubmissionStatistics.rate(from: previous, to: current)
+                let fps = Int(rate.framesPerSecond.rounded())
                 liveMetrics.senderFPS = fps
+                liveMetrics.dpcm = rate.dpcm
                 senderFPS = fps
-                sentSnapshot = total
+                lastSubmissionSnapshot = current
             }
         }
     }

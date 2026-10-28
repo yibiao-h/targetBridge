@@ -1958,6 +1958,9 @@ static void send_receiver_info(struct app *a) {
     }
     escaped_name[out] = '\0';
 
+    /* Both wire formats require the same working Metal decoder. The adaptive
+     * format is opt-in so an older receiver never sees its per-tile marker. */
+    const char *supports_dpcm = tb_disp_dpcm_available(a->disp) ? "true" : "false";
     char json[1024];
     int json_len = snprintf(
         json,
@@ -1965,7 +1968,7 @@ static void send_receiver_info(struct app *a) {
         "{\"receiverName\":\"%s\",\"panelWidth\":%u,\"panelHeight\":%u,"
         "\"modeWidth\":%u,\"modeHeight\":%u,\"refreshRate\":60,"
         "\"hiDPI\":%s,\"captureWidth\":%u,\"captureHeight\":%u,"
-        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"supportsDPCM\":%s,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s,"
+        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"supportsDPCM\":%s,\"supportsDPCMAdaptiveColor\":%s,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s,"
         "\"supportsNightShift\":%s,\"supportsTrueTone\":%s}",
         escaped_name,
         profile.panel_w,
@@ -1976,10 +1979,8 @@ static void send_receiver_info(struct app *a) {
         profile.capture_w,
         profile.capture_h,
         tb_dec_supports_hevc_hwdecode() ? "true" : "false",
-        /* Conditional on a working Metal decoder, not merely on this build
-         * having the code: the CPU fallback is 166 ms/frame at 5K, so a
-         * receiver without a usable GPU path must keep receiving NV12. */
-        tb_disp_dpcm_available(a->disp) ? "true" : "false",
+        supports_dpcm,
+        supports_dpcm,
         tb_receiver_input_monitoring_trusted() ? "true" : "false",
         tb_receiver_accessibility_trusted() ? "true" : "false",
         tb_night_shift_supported() ? "true" : "false",

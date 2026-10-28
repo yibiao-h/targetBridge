@@ -10,7 +10,13 @@ static void pump(void) {
     [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode beforeDate:end];
 }
 
-static void test_decode(int width, int height, int ten_bit) {
+static uint32_t get_le32(const uint8_t *p) {
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
+           (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static void test_decode_variant(int width, int height, int ten_bit,
+                                int adaptive, int mixed_tiles) {
     size_t pixel_bytes = (size_t)width * height * 4;
     uint32_t *pixels = malloc(pixel_bytes);
     uint32_t mask = ten_bit ? 1023u : 255u;
@@ -22,6 +28,18 @@ static void test_decode(int width, int height, int ten_bit) {
             uint32_t b = (uint32_t)(x + y) & mask;
             uint32_t green = (uint32_t)(x * 17 + y * 29) & mask;
             uint32_t red = (uint32_t)(x * 31 + y * 7) & mask;
+            if (adaptive) {
+                green = (uint32_t)(x + y * 29) & mask;
+                b = (green + 31) & mask;
+                red = (green + mask - 7) & mask;
+                if (mixed_tiles && ((x / TB_DPCM_TILE + y / TB_DPCM_TILE) & 1)) {
+                    /* Here RGB residuals need fewer bits than B-G/R-G, so
+                     * these tiles must retain the original coding space. */
+                    b = (uint32_t)((x % TB_DPCM_TILE) + (y % TB_DPCM_TILE) * TB_DPCM_TILE);
+                    green = mask - b;
+                    red = b;
+                }
+            }
             pixels[(size_t)y * width + x] = alpha | b | (green << bits) | (red << (2 * bits));
         }
     }
@@ -29,8 +47,23 @@ static void test_decode(int width, int height, int ten_bit) {
     uint8_t *blob = malloc(capacity);
     uint8_t *reference = malloc(pixel_bytes);
     assert(blob && reference);
-    size_t length = tb_dpcm_encode((const uint8_t *)pixels, width * 4,
-                                  width, height, ten_bit, blob, capacity);
+    size_t length = adaptive
+        ? tb_dpcm_encode_adaptive((const uint8_t *)pixels, width * 4,
+                                  width, height, ten_bit, blob, capacity)
+        : tb_dpcm_encode((const uint8_t *)pixels, width * 4,
+                         width, height, ten_bit, blob, capacity);
+    struct tb_dpcm_info info;
+    assert(length && tb_dpcm_parse(blob, length, &info) == 0);
+    assert(info.adaptive_color == adaptive);
+    if (adaptive) {
+        unsigned transformed = 0;
+        for (uint32_t tile = 0; tile < info.tile_count; ++tile) {
+            if (get_le32(blob + info.seed_plane_off + (size_t)tile * 4) &
+                TB_DPCM_SEED_ADAPTIVE_COLOR) ++transformed;
+        }
+        assert(transformed > 0);
+        if (mixed_tiles) assert(transformed < info.tile_count);
+    }
     assert(tb_metal_plane_accepts_dpcm(blob, length));
     assert(length && tb_dpcm_decode(blob, length, reference, width * 4) == 0);
     assert(memcmp(pixels, reference, pixel_bytes) == 0);
@@ -56,6 +89,10 @@ static void test_decode(int width, int height, int ten_bit) {
     free(reference);
     free(blob);
     free(pixels);
+}
+
+static void test_decode(int width, int height, int ten_bit) {
+    test_decode_variant(width, height, ten_bit, 0, 0);
 }
 
 static void put_le32(uint8_t *p, uint32_t value) {
@@ -228,9 +265,18 @@ int main(void) {
             pump();
             test_decode(65, 65, 0);
             test_decode(65, 65, 1);
+            /* Restore all 1024 values, including the low two bits, after the
+             * modulo color transform. Then mix transformed/raw tiles and
+             * exercise partial tiles at both sample depths. */
+            test_decode_variant(1024, 4, 1, 1, 0);
+            test_decode_variant(65, 65, 0, 1, 0);
+            test_decode_variant(65, 65, 1, 1, 0);
+            test_decode_variant(65, 65, 0, 1, 1);
+            test_decode_variant(65, 65, 1, 1, 1);
             test_cursor_shapes();
             /* Full 4.5K frame, including the final partial group of 16 tiles. */
             test_decode(4480, 2520, 1);
+            test_decode_variant(4480, 2520, 1, 1, 1);
             test_decode(65, 65, 1);
             tb_metal_plane_set_hidden(1);
             assert(!tb_metal_plane_available() && !g.view);
@@ -242,7 +288,7 @@ int main(void) {
         SDL_DestroyRenderer(renderer);
         SDL_DestroyWindow(window);
         SDL_Quit();
-        puts("Metal DPCM: 8/10-bit CPU parity, all 1024 levels, partial tiles, hidden first frame, fallback/teardown, cursor shapes/size/hotspots and resource limits passed");
+        puts("Metal DPCM: legacy/adaptive 8/10-bit CPU parity, mixed color tiles, all 1024 levels, partial tiles, 4.5K frames, hidden first frame, fallback/teardown, cursor shapes/size/hotspots and resource limits passed");
     }
     return 0;
 }

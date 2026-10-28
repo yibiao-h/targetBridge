@@ -12,19 +12,16 @@
  *
  * WHY THIS EXISTS
  *
- * The receiver spends 23.4 ms of a 36 ms frame just pulling bytes off the wire
- * (single-core cost inside the TCP stack, measured), and another 12.9 ms pushing
- * the same bytes across PCIe to the GPU. Both costs are proportional to frame
- * size, so the cheapest way to raise the frame rate is to send fewer bytes.
- * Damage rectangles already handle the case where little changed; this handles
- * the case they cannot — fullscreen video and fast scrolling, where most of the
- * screen genuinely is new every frame and the sender falls back to full frames.
+ * Large full-frame payloads cost network bandwidth and GPU upload time. The
+ * current Sender sends complete frames and does not use temporal prediction or
+ * damage rectangles. Spatial compression reduces those costs when neighbouring
+ * samples are correlated; unrelated noise still approaches raw size.
  *
- * Measured on real content (see the ratio probe): 2.96x on a 36-megapixel photo,
- * which is close to worst case, 4.5x on text-heavy UI, 13.8x on ordinary window
- * chrome. LZFSE on the same photo gets 3.48x, so this captures 85% of what a
- * real entropy coder finds, at a small fraction of the cost. It is LOSSLESS —
- * every output sample is bit-identical to the input.
+ * Compression depends on the actual captured samples. A single large residual
+ * sets the width of an entire tile-channel: dense antialiased text and low-bit
+ * noise can therefore approach raw size, especially at 10-bit depth. Historical
+ * 8-bit ratios are not 10-bit guarantees. The optional adaptive colour extension
+ * reduces redundant RGB residuals without changing any captured sample.
  *
  * THE SHAPE OF THE FORMAT, AND WHY
  *
@@ -108,6 +105,16 @@ extern "C" {
 /* flags */
 #define TB_DPCM_FLAG_ALPHA_OMITTED  0x01u
 #define TB_DPCM_FLAG_TEN_BIT        0x02u /* samples are 10-bit ('l10r') */
+#define TB_DPCM_FLAG_ADAPTIVE_COLOR 0x04u
+
+/* Negotiated extension (supportsDPCMAdaptiveColor). With this frame flag,
+ * bit 31 of each seed selects the reversible (B-G, G, R-G) domain, modulo
+ * 2^sampleDepth. Bits 0..3*depth-1 carry that domain's seed. Without the marker
+ * the tile remains RGB. Widths, prediction and layout are unchanged. Encoders
+ * select the transformed domain only when its sum of widths is strictly less,
+ * so no tile grows. Alpha remains omitted. Old receivers must receive this
+ * extension flag clear. */
+#define TB_DPCM_SEED_ADAPTIVE_COLOR 0x80000000u
 
 /* Fixed-size prologue. All fields little-endian. Immediately followed by:
  *   group_count * uint32   group base offsets, in BITS into the payload
@@ -140,6 +147,7 @@ struct tb_dpcm_info {
     int      channels;           /* 3 */
     int      alpha_omitted;
     int      ten_bit;
+    int      adaptive_color;
     int      tiles_x, tiles_y;
     uint32_t tile_count;
     uint32_t group_count;
@@ -167,6 +175,11 @@ size_t tb_dpcm_max_size(int w, int h);
  * CPU stays free for the person using the machine. */
 size_t tb_dpcm_encode(const uint8_t *src, int stride, int w, int h,
                       int ten_bit, uint8_t *dst, size_t dst_cap);
+
+/* Same contract, with negotiated adaptive colour enabled. Never larger than
+ * tb_dpcm_encode on the same pixels. Requires an extended decoder. */
+size_t tb_dpcm_encode_adaptive(const uint8_t *src, int stride, int w, int h,
+                               int ten_bit, uint8_t *dst, size_t dst_cap);
 
 /* Validate a blob and fill in `out`. Returns 0 on success, non-zero if the blob
  * is malformed or inconsistent — this runs on untrusted network data, so every

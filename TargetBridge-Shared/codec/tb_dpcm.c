@@ -119,6 +119,19 @@ static inline uint32_t sample_of(uint32_t px, int c, const struct depth *d) {
     return (px >> (c * d->bits)) & d->mask;
 }
 
+static inline uint32_t sample_in_domain(uint32_t px, int c, const struct depth *d,
+                                        int transformed) {
+    const uint32_t value = sample_of(px, c, d);
+    return transformed && c != 1 ? (value - sample_of(px, 1, d)) & d->mask : value;
+}
+
+static uint32_t color_transform(uint32_t px, const struct depth *d, int inverse) {
+    const uint32_t g = sample_of(px, 1, d);
+    const uint32_t delta = inverse ? g : (0u - g);
+    return ((sample_of(px, 0, d) + delta) & d->mask) | (g << d->bits) |
+           (((sample_of(px, 2, d) + delta) & d->mask) << (2 * d->bits));
+}
+
 /* Residual as stored: the modular difference re-centred and zigzagged so small
  * magnitudes of either sign need few bits. Reconstruction wraps, so no clamping
  * is needed anywhere and the round trip is exact. */
@@ -227,8 +240,8 @@ static inline size_t group_align(size_t bitpos, uint32_t t) {
     return bitpos;
 }
 
-size_t tb_dpcm_encode(const uint8_t *src, int stride, int w, int h,
-                      int ten_bit, uint8_t *dst, size_t dst_cap) {
+static size_t encode(const uint8_t *src, int stride, int w, int h,
+                      int ten_bit, int adaptive_color, uint8_t *dst, size_t dst_cap) {
     if (!src || !dst || !dims_ok(w, h) || stride < w * 4) return 0;
 
     struct geom g;
@@ -238,6 +251,8 @@ size_t tb_dpcm_encode(const uint8_t *src, int stride, int w, int h,
 
     uint8_t *widths = calloc(g.tile_count, TB_DPCM_CHANNELS);
     if (!widths) return 0;
+    uint8_t *domains = adaptive_color ? calloc(g.tile_count, 1) : NULL;
+    if (adaptive_color && !domains) { free(widths); return 0; }
 
     /* Pass 1: the widest residual in each tile-channel decides its bit width. */
     for (uint32_t t = 0; t < g.tile_count; ++t) {
@@ -245,15 +260,30 @@ size_t tb_dpcm_encode(const uint8_t *src, int stride, int w, int h,
         tile_rect(&g, t, w, h, &tx, &ty, &tw, &th);
         const uint8_t *tile = src + (size_t)ty * stride + (size_t)tx * 4;
 
+        uint8_t transformed_widths[TB_DPCM_CHANNELS] = {0};
+        int rgb_cost = 0, transformed_cost = 0;
         for (int c = 0; c < TB_DPCM_CHANNELS; ++c) {
             uint32_t widest = 0;
+            uint32_t transformed_widest = 0;
             TB_TILE_WALK(tw, th, {
-                uint32_t cur  = sample_of(px_load(tile + (size_t)_y  * stride + (size_t)_x  * 4), c, &d);
-                uint32_t pred = sample_of(px_load(tile + (size_t)_py * stride + (size_t)_px * 4), c, &d);
-                uint32_t z = resid_encode(cur, pred, &d);
+                uint32_t cur = px_load(tile + (size_t)_y * stride + (size_t)_x * 4);
+                uint32_t pred = px_load(tile + (size_t)_py * stride + (size_t)_px * 4);
+                uint32_t z = resid_encode(sample_of(cur, c, &d), sample_of(pred, c, &d), &d);
                 if (z > widest) widest = z;
+                if (adaptive_color) {
+                    uint32_t transformed_z = resid_encode(sample_in_domain(cur, c, &d, 1),
+                                                           sample_in_domain(pred, c, &d, 1), &d);
+                    if (transformed_z > transformed_widest) transformed_widest = transformed_z;
+                }
             });
             widths[t * TB_DPCM_CHANNELS + c] = (uint8_t)bits_for(widest);
+            rgb_cost += bits_for(widest);
+            transformed_widths[c] = (uint8_t)bits_for(transformed_widest);
+            transformed_cost += transformed_widths[c];
+        }
+        if (adaptive_color && transformed_cost < rgb_cost) {
+            domains[t] = 1;
+            memcpy(widths + t * TB_DPCM_CHANNELS, transformed_widths, TB_DPCM_CHANNELS);
         }
     }
 
@@ -292,21 +322,25 @@ size_t tb_dpcm_encode(const uint8_t *src, int stride, int w, int h,
         tile_rect(&g, t, w, h, &tx, &ty, &tw, &th);
         const uint8_t *tile = src + (size_t)ty * stride + (size_t)tx * 4;
 
-        /* The seed is the tile's top-left pixel, stored raw with alpha dropped. */
-        put_u32(dst + g.seed_plane_off + (size_t)t * 4, px_load(tile) & ~d.alpha);
+        const int transformed = adaptive_color && domains[t];
+        const uint32_t seed = transformed
+            ? color_transform(px_load(tile), &d, 0) | TB_DPCM_SEED_ADAPTIVE_COLOR
+            : px_load(tile) & ~d.alpha;
+        put_u32(dst + g.seed_plane_off + (size_t)t * 4, seed);
 
         for (int c = 0; c < TB_DPCM_CHANNELS; ++c) {
             const int n = widths[t * TB_DPCM_CHANNELS + c];
             if (n == 0) continue;   /* flat: every residual is zero */
             TB_TILE_WALK(tw, th, {
-                uint32_t cur  = sample_of(px_load(tile + (size_t)_y  * stride + (size_t)_x  * 4), c, &d);
-                uint32_t pred = sample_of(px_load(tile + (size_t)_py * stride + (size_t)_px * 4), c, &d);
+                uint32_t cur  = sample_in_domain(px_load(tile + (size_t)_y  * stride + (size_t)_x  * 4), c, &d, transformed);
+                uint32_t pred = sample_in_domain(px_load(tile + (size_t)_py * stride + (size_t)_px * 4), c, &d, transformed);
                 bw_put(dst + g.payload_off, bitpos, resid_encode(cur, pred, &d), n);
                 bitpos += n;
             });
         }
     }
     free(widths);
+    free(domains);
 
     put_u32(dst +  0, TB_DPCM_MAGIC);
     put_u32(dst +  4, (uint32_t)w);
@@ -314,7 +348,8 @@ size_t tb_dpcm_encode(const uint8_t *src, int stride, int w, int h,
     dst[12] = 3;                                  /* log2(8) */
     dst[13] = TB_DPCM_CHANNELS;
     dst[14] = (uint8_t)(TB_DPCM_FLAG_ALPHA_OMITTED |
-                        (ten_bit ? TB_DPCM_FLAG_TEN_BIT : 0u));
+                        (ten_bit ? TB_DPCM_FLAG_TEN_BIT : 0u) |
+                        (adaptive_color ? TB_DPCM_FLAG_ADAPTIVE_COLOR : 0u));
     dst[15] = 0;
     put_u32(dst + 16, g.group_count);
     put_u32(dst + 20, (uint32_t)g.width_plane_bytes);
@@ -322,6 +357,16 @@ size_t tb_dpcm_encode(const uint8_t *src, int stride, int w, int h,
     put_u32(dst + 28, (uint32_t)payload_bytes);
 
     return g.payload_off + payload_bytes;
+}
+
+size_t tb_dpcm_encode(const uint8_t *src, int stride, int w, int h,
+                      int ten_bit, uint8_t *dst, size_t dst_cap) {
+    return encode(src, stride, w, h, ten_bit, 0, dst, dst_cap);
+}
+
+size_t tb_dpcm_encode_adaptive(const uint8_t *src, int stride, int w, int h,
+                               int ten_bit, uint8_t *dst, size_t dst_cap) {
+    return encode(src, stride, w, h, ten_bit, 1, dst, dst_cap);
 }
 
 /* -------------------------------------------------------------------- parsing */
@@ -338,7 +383,8 @@ int tb_dpcm_parse(const uint8_t *src, size_t len, struct tb_dpcm_info *out) {
     const uint8_t flags = src[14];
     /* TBD2 carries RGB only. Unknown layouts must not be silently decoded as
      * opaque RGB; future extensions require explicit format negotiation. */
-    const uint8_t known_flags = TB_DPCM_FLAG_ALPHA_OMITTED | TB_DPCM_FLAG_TEN_BIT;
+    const uint8_t known_flags = TB_DPCM_FLAG_ALPHA_OMITTED | TB_DPCM_FLAG_TEN_BIT |
+                                TB_DPCM_FLAG_ADAPTIVE_COLOR;
     if (!(flags & TB_DPCM_FLAG_ALPHA_OMITTED) || (flags & ~known_flags) || src[15] != 0)
         return -1;
     const int ten_bit = (flags & TB_DPCM_FLAG_TEN_BIT) ? 1 : 0;
@@ -385,6 +431,7 @@ int tb_dpcm_parse(const uint8_t *src, size_t len, struct tb_dpcm_info *out) {
     out->channels      = TB_DPCM_CHANNELS;
     out->alpha_omitted = (flags & TB_DPCM_FLAG_ALPHA_OMITTED) ? 1 : 0;
     out->ten_bit       = ten_bit;
+    out->adaptive_color = (flags & TB_DPCM_FLAG_ADAPTIVE_COLOR) ? 1 : 0;
     out->tiles_x       = g.tiles_x;
     out->tiles_y       = g.tiles_y;
     out->tile_count    = g.tile_count;
@@ -454,6 +501,12 @@ int tb_dpcm_decode(const uint8_t *src, size_t len, uint8_t *dst, int stride) {
                 bitpos += n;
                 px_store(cp, (px_load(cp) & keep) | (v << shift));
             });
+        }
+        if (in.adaptive_color && (seed & TB_DPCM_SEED_ADAPTIVE_COLOR)) {
+            for (int y = 0; y < th; ++y) for (int x = 0; x < tw; ++x) {
+                uint8_t *p = tile + (size_t)y * stride + (size_t)x * 4;
+                px_store(p, color_transform(px_load(p), &d, 1) | d.alpha);
+            }
         }
     }
     return 0;

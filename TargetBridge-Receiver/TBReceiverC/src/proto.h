@@ -51,15 +51,13 @@
  * payload is one TBD2 blob and nothing else -- its own header carries the
  * dimensions, so none are repeated here.
  *
- * Measured 2.96x on near-worst-case photographic content and 4.5-14x on desktop
- * content, which turns a 23.4 ms receive into ~8 ms on the target hardware.
- *
- * Only sent to a receiver that advertised "supportsDPCM" in its display profile,
- * which is conditional on a working Metal decoder: decoding costs ~44 million bit
- * extractions per 5K frame, which that receiver's CPU cannot afford (166 ms
- * single-threaded on its i5, against 6.5 ms on its GPU). A silent peer is an old
- * peer and keeps getting TB_PKT_RAW_FRAME, so this is additive -- an unpatched
- * receiver is unaffected. */
+ * Only sent to a receiver that advertised "supportsDPCM" with a working Metal
+ * decoder. The optional TB_DPCM_FLAG_ADAPTIVE_COLOR flag additionally requires
+ * "supportsDPCMAdaptiveColor". In those blobs, seed bit 31 selects each tile's
+ * coding space: raw RGB or reversible (B-G),G,(R-G), modulo the sample range.
+ * RGB reconstruction adds G back to B/R after all residuals have been decoded.
+ * A sender must leave the flag clear for an older receiver. Compression varies
+ * with content; both variants preserve every captured 8-bit or 10-bit sample. */
 #define TB_PKT_RAW_DPCM         0x25
 #define TB_PKT_HEARTBEAT        0x30
 #define TB_PKT_TEARDOWN         0x31

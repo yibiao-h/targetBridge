@@ -58,7 +58,20 @@ final class TBMonitorProtocolTests: XCTestCase {
         let profile = try JSONDecoder().decode(TBMonitorDisplayProfile.self, from: olderProfile)
         XCTAssertNil(profile.supportsRawNV12)
         XCTAssertNil(profile.supportsDPCM)
+        XCTAssertNil(profile.supportsDPCMAdaptiveColor)
         XCTAssertEqual(TBMonitorPacketType.rawDPCM.rawValue, 0x25)
+
+        var advertised = try XCTUnwrap(JSONSerialization.jsonObject(with: olderProfile) as? [String: Any])
+        advertised["supportsDPCM"] = true
+        for capability in [false, true] {
+            advertised["supportsDPCMAdaptiveColor"] = capability
+            let data = try JSONSerialization.data(withJSONObject: advertised)
+            let extended = try JSONDecoder().decode(TBMonitorDisplayProfile.self, from: data)
+            XCTAssertEqual(extended.supportsDPCMAdaptiveColor, capability)
+            let roundTrip = try JSONDecoder().decode(TBMonitorDisplayProfile.self,
+                                                    from: JSONEncoder().encode(extended))
+            XCTAssertEqual(roundTrip.supportsDPCMAdaptiveColor, capability)
+        }
     }
 
     func testDrainPacketRoundTrip() throws {

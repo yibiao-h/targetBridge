@@ -30,6 +30,7 @@ struct enc_params {
     /* Named `mid`, not `half`: `half` is a reserved type in Metal Shading
      * Language (half-precision float) and a member of that name will not parse. */
     uint32_t mid;
+    uint32_t adaptiveColor;
 };
 
 /* Where every plane of every band sits. Identical for all bands of a frame —
@@ -118,12 +119,17 @@ static NSString *tb_enc_shader_source(void) {
     "struct EncParams {\n"
     "  uint width, height, tilesX, tilesY, tileCount;\n"
     "  uint srcStridePx;\n"
-    "  uint bits, mask, mid;\n"
+    "  uint bits, mask, mid, adaptiveColor;\n"
     "};\n"
     "\n"
     "static inline uint tb_sample(uint px, uint c, constant EncParams &P) {\n"
     "  return (px >> (c * P.bits)) & P.mask;\n"
     "}\n"
+    "static inline uint tb_domain_sample(uint px, uint c, bool green, constant EncParams &P) {\n"
+    "  const uint v = tb_sample(px, c, P);\n"
+    "  return (green && c != 1u) ? ((v - tb_sample(px, 1u, P)) & P.mask) : v;\n"
+    "}\n"
+    "static inline uint tb_width(uint v) { return v == 0u ? 0u : 32u - clz(v); }\n"
     /* The modular difference, re-centred and zigzagged. Must match
      * resid_encode() in tb_dpcm.c exactly. */
     "static inline uint tb_resid(uint cur, uint pred, constant EncParams &P) {\n"
@@ -148,7 +154,7 @@ static NSString *tb_enc_shader_source(void) {
     "  const uint th = min(8u, P.height - ty);\n"
     "  const bool live = (x < tw && y < th) && !(x == 0u && y == 0u);\n"
     "\n"
-    "  uint3 z = uint3(0u);\n"
+    "  uint3 z = uint3(0u), zg = uint3(0u);\n"
     "  if (live) {\n"
     "    const uint pxi = (x > 0u) ? (x - 1u) : 0u;\n"
     "    const uint pyi = (x > 0u) ? y : (y - 1u);\n"
@@ -157,27 +163,45 @@ static NSString *tb_enc_shader_source(void) {
     "    z.x = tb_resid(tb_sample(cur, 0u, P), tb_sample(pred, 0u, P), P);\n"
     "    z.y = tb_resid(tb_sample(cur, 1u, P), tb_sample(pred, 1u, P), P);\n"
     "    z.z = tb_resid(tb_sample(cur, 2u, P), tb_sample(pred, 2u, P), P);\n"
+    "    if (P.adaptiveColor != 0u) {\n"
+    "      zg.x = tb_resid(tb_domain_sample(cur, 0u, true, P), tb_domain_sample(pred, 0u, true, P), P);\n"
+    "      zg.y = z.y;\n"
+    "      zg.z = tb_resid(tb_domain_sample(cur, 2u, true, P), tb_domain_sample(pred, 2u, true, P), P);\n"
+    "    }\n"
     "  }\n"
     "\n"
     "  threadgroup uint3 red[64];\n"
+    "  threadgroup uint3 greenRed[64];\n"
     "  red[lane] = z;\n"
+    "  if (P.adaptiveColor != 0u) greenRed[lane] = zg;\n"
     "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
     "  for (uint off = 32u; off > 0u; off >>= 1) {\n"
-    "    if (lane < off) red[lane] = max(red[lane], red[lane + off]);\n"
+    "    if (lane < off) {\n"
+    "      red[lane] = max(red[lane], red[lane + off]);\n"
+    "      if (P.adaptiveColor != 0u) greenRed[lane] = max(greenRed[lane], greenRed[lane + off]);\n"
+    "    }\n"
     "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
     "  }\n"
     "  if (lane != 0u) return;\n"
     "\n"
     "  const uint3 m = red[0];\n"
-    "  const uint n0 = (m.x == 0u) ? 0u : (32u - clz(m.x));\n"
-    "  const uint n1 = (m.y == 0u) ? 0u : (32u - clz(m.y));\n"
-    "  const uint n2 = (m.z == 0u) ? 0u : (32u - clz(m.z));\n"
-    "  meta[tile * 2u + 0u] = n0 | (n1 << 8) | (n2 << 16);\n"
-    "  meta[tile * 2u + 1u] = (n0 + n1 + n2) * (tw * th - 1u);\n"
+    "  uint3 widths = uint3(tb_width(m.x), tb_width(m.y), tb_width(m.z));\n"
+    "  bool green = false;\n"
+    "  if (P.adaptiveColor != 0u) {\n"
+    "    const uint3 mg = greenRed[0];\n"
+    "    const uint3 gw = uint3(tb_width(mg.x), tb_width(mg.y), tb_width(mg.z));\n"
+    "    green = (gw.x + gw.y + gw.z) < (widths.x + widths.y + widths.z);\n"
+    "    if (green) widths = gw;\n"
+    "  }\n"
+    "  const uint marker = green ? 0x80000000u : 0u;\n"
+    "  meta[tile * 2u + 0u] = widths.x | (widths.y << 8) | (widths.z << 16) | marker;\n"
+    "  meta[tile * 2u + 1u] = (widths.x + widths.y + widths.z) * (tw * th - 1u);\n"
     /* The seed is the tile's top-left pixel with alpha stripped; the decoder
      * puts opaque alpha back. */
-    "  const uint alphaMask = (P.bits == 10u) ? (3u << 30) : (0xFFu << 24);\n"
-    "  seeds[tile] = src[ty * P.srcStridePx + tx] & ~alphaMask;\n"
+    "  const uint seed = src[ty * P.srcStridePx + tx];\n"
+    "  seeds[tile] = tb_domain_sample(seed, 0u, green, P)\n"
+    "              | (tb_domain_sample(seed, 1u, green, P) << P.bits)\n"
+    "              | (tb_domain_sample(seed, 2u, green, P) << (P.bits * 2u)) | marker;\n"
     "}\n"
     "\n"
     /* ---- step 3: pack ----
@@ -315,6 +339,7 @@ static NSString *tb_enc_shader_source(void) {
     "  if (tile >= P.tileCount) return;\n"
     "\n"
     "  const uint packed = meta[tile * 2u + 0u];\n"
+    "  const bool green = P.adaptiveColor != 0u && (packed & 0x80000000u) != 0u;\n"
     "  const uint n = (packed >> (8u * c)) & 0xFFu;\n"
     "  if (n == 0u) return;\n"
     "\n"
@@ -341,7 +366,7 @@ static NSString *tb_enc_shader_source(void) {
     "    const uint pyi = (x > 0u) ? y : (y - 1u);\n"
     "    const uint cur  = src[(ty + y)   * P.srcStridePx + (tx + x)];\n"
     "    const uint pred = src[(ty + pyi) * P.srcStridePx + (tx + pxi)];\n"
-    "    const uint v = tb_resid(tb_sample(cur, c, P), tb_sample(pred, c, P), P);\n"
+    "    const uint v = tb_resid(tb_domain_sample(cur, c, green, P), tb_domain_sample(pred, c, green, P), P);\n"
     "\n"
     "    const uint room = 32u - fill;\n"
     "    const uint lo   = min(n, room);\n"
@@ -561,9 +586,9 @@ static void plan_band(uint8_t *blob_base, const uint8_t *meta_base, uint8_t *off
 
 /* --------------------------------------------------------------------- encode */
 
-size_t tb_dpcm_gpu_encode_bands(tb_dpcm_gpu *e,
+static size_t encode_bands_impl(tb_dpcm_gpu *e,
                                 const uint8_t *src, int stride, int w, int band_h,
-                                int band_count, int ten_bit, size_t header_reserve,
+                                int band_count, int ten_bit, int adaptive_color, size_t header_reserve,
                                 tb_dpcm_gpu_band *out) {
     if (!e || !src || !out || w <= 0 || band_h <= 0 || stride < w * 4) return 0;
     if (band_count < 1 || band_count > TB_DPCM_GPU_MAX_BANDS) return 0;
@@ -649,7 +674,8 @@ size_t tb_dpcm_gpu_encode_bands(tb_dpcm_gpu *e,
             (uint32_t)(stride / 4),
             ten_bit ? 10u : 8u,
             ten_bit ? 0x3FFu : 0xFFu,
-            ten_bit ? 0x200u : 0x80u
+            ten_bit ? 0x200u : 0x80u,
+            adaptive_color ? 1u : 0u
         };
 
         /* ---- step 1: analyze, every band in one submission ----
@@ -729,7 +755,8 @@ size_t tb_dpcm_gpu_encode_bands(tb_dpcm_gpu *e,
             blob[12] = 3;
             blob[13] = TB_DPCM_CHANNELS;
             blob[14] = (uint8_t)(TB_DPCM_FLAG_ALPHA_OMITTED |
-                                 (ten_bit ? TB_DPCM_FLAG_TEN_BIT : 0u));
+                                 (ten_bit ? TB_DPCM_FLAG_TEN_BIT : 0u) |
+                                 (adaptive_color ? TB_DPCM_FLAG_ADAPTIVE_COLOR : 0u));
             blob[15] = 0;
             put_u32(blob + 16, group_count);
             put_u32(blob + 20, (uint32_t)width_plane_bytes);
@@ -791,17 +818,39 @@ size_t tb_dpcm_gpu_encode_bands(tb_dpcm_gpu *e,
     return total_all;
 }
 
+size_t tb_dpcm_gpu_encode_bands(tb_dpcm_gpu *e,
+                                const uint8_t *src, int stride, int w, int band_h,
+                                int band_count, int ten_bit, size_t header_reserve,
+                                tb_dpcm_gpu_band *out) {
+    return encode_bands_impl(e, src, stride, w, band_h, band_count, ten_bit, 0,
+                             header_reserve, out);
+}
+
+static size_t encode_one(tb_dpcm_gpu *e,
+                          const uint8_t *src, int stride, int w, int h,
+                          int ten_bit, int adaptive_color, size_t header_reserve,
+                          const uint8_t **out_blob) {
+    if (!out_blob) return 0;
+    tb_dpcm_gpu_band band = { NULL, 0 };
+    const size_t n = encode_bands_impl(e, src, stride, w, h, 1,
+                                      ten_bit, adaptive_color, header_reserve, &band);
+    if (n == 0 || !band.blob) return 0;
+    *out_blob = band.blob;
+    return band.len;
+}
+
 size_t tb_dpcm_gpu_encode(tb_dpcm_gpu *e,
                           const uint8_t *src, int stride, int w, int h,
                           int ten_bit, size_t header_reserve,
                           const uint8_t **out_blob) {
-    if (!out_blob) return 0;
-    tb_dpcm_gpu_band band = { NULL, 0 };
-    const size_t n = tb_dpcm_gpu_encode_bands(e, src, stride, w, h, 1,
-                                              ten_bit, header_reserve, &band);
-    if (n == 0 || !band.blob) return 0;
-    *out_blob = band.blob;
-    return band.len;
+    return encode_one(e, src, stride, w, h, ten_bit, 0, header_reserve, out_blob);
+}
+
+size_t tb_dpcm_gpu_encode_adaptive(tb_dpcm_gpu *e,
+                                   const uint8_t *src, int stride, int w, int h,
+                                   int ten_bit, size_t header_reserve,
+                                   const uint8_t **out_blob) {
+    return encode_one(e, src, stride, w, h, ten_bit, 1, header_reserve, out_blob);
 }
 
 /* ------------------------------------------------------------- non-blocking */
@@ -919,7 +968,8 @@ int tb_dpcm_gpu_encode_bands_async(tb_dpcm_gpu *e,
         (uint32_t)(stride / 4),
         ten_bit ? 10u : 8u,
         ten_bit ? 0x3FFu : 0xFFu,
-        ten_bit ? 0x200u : 0x80u
+        ten_bit ? 0x200u : 0x80u,
+        0u /* The public async API retains legacy RGB coding. */
     };
 
     @autoreleasepool {

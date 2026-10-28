@@ -45,6 +45,7 @@ panel scanout are outside the codec's bit-exact guarantee. Capture remains SDR.
 
 | Receiver / selected mode | Capture and wire format |
 |---|---|
+| DPCM receiver also advertises `supportsDPCMAdaptiveColor` | 10-bit TBD2 with reversible per-tile colour decorrelation |
 | DPCM preset, receiver advertises a working Metal DPCM decoder | Display P3 10-bit RGB, TBD2 (`0x25`) |
 | DPCM preset, old receiver supports raw NV12 | 8-bit NV12, existing raw packet (`0x22`) |
 | DPCM preset, receiver supports neither DPCM nor raw NV12 | Existing HEVC/H.264 path, subject to encoder availability |
@@ -78,6 +79,27 @@ pixel and per-channel residual widths. Remaining pixels predict from the left,
 except the first column which predicts from above. Modular residuals and zigzag
 coding preserve samples exactly at either supported codec depth (8 or 10 bits).
 The current Sender DPCM presets accept only 10-bit capture.
+
+When the receiver advertises `supportsDPCMAdaptiveColor`, each tile compares
+RGB coding with `(B-G, G, R-G)` modulo 1024 (256 in the 8-bit codec tests).
+It chooses the latter only when the sum of residual widths is smaller. This
+removes repeated residuals in correlated RGB content such as grayscale text,
+preserves every captured bit, and never enlarges a tile's payload. The GPU
+performs the comparison and transform within its existing analysis/packing
+passes; there is no additional CPU pass over the captured frame.
+
+The extension uses header flag `0x04` and bit 31 of each seed to identify a
+transformed tile. The decoder adds green back to blue and red after residual
+reconstruction. Layout, packet type and maximum frame size stay the same.
+Old receivers get the original format with this flag clear; old senders work
+with the extended decoder. Both apps must be updated to obtain the improvement.
+
+This is spatial, lossless compression, not a fixed bitrate video codec. Dense
+edges and independent RGB noise can still make residuals wide. At 4480 × 2520,
+the largest legacy 10-bit payload is about 42.66 MB: approximately 10.24 Gbps
+at 30 frames/s or 20.47 Gbps at 60 frames/s, before network overhead. Adaptive
+colour cannot compress independent noise further. Historical ratios for other
+images or 8-bit input are not guarantees for captured 10-bit desktops.
 
 Groups of 64 tiles share an offset table. The CPU parser checks dimensions,
 widths, payload sizes and group offsets before the Metal decoder accesses the
@@ -148,7 +170,15 @@ includes rejected frames as well as a full queue; correlate it with error logs. 
 to distinguish capture cadence, encoding work and a full send queue; a cable
 speed or FPS number alone does not identify the bottleneck. Packet construction
 copies the encoded bytes once into owned memory; subsequent GPU frames cannot
-overwrite packets still being sent. The 10-bit wire format remains unchanged.
+overwrite packets still being sent.
+
+The Sender's monitor details show actual DPCM dimensions, submitted video Gbps,
+average MB/frame, compression relative to packed 32-bit capture, encoding time,
+and GPU/CPU backend. FPS and bitrate use the same elapsed-time window. These
+are application video submissions, excluding TCP overhead/retransmissions and
+other sessions, and do not measure receiver presentation FPS. Activity Monitor
+can include other traffic; check whether its units are bytes/s or bits/s before
+comparing (1 GB/s = 8 Gbps). No diagnostic launcher is needed for these details.
 
 Before calling the path ready for general use, run real two-machine sessions
 on Apple Silicon and Intel receivers. Record source and receiver model, macOS
