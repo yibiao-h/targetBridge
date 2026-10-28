@@ -30,6 +30,9 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
     case smooth1800p60
     case crisp2160p60
     case retina4k60
+    case retina4_5k60
+    /// Experimental packed 10-bit RGB at the 24-inch iMac native resolution.
+    case native4_5kRaw60
     case native5k
     case native5k60Experimental
     /// Experimental 10-bit RGB transport, targeting 5120x2880 at 60 FPS.
@@ -54,10 +57,14 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return "Crisp"
         case .retina4k60:
             return "Retina 4K"
+        case .retina4_5k60:
+            return "iMac 4.5K"
         case .native5k:
             return "5K"
         case .native5k60Experimental:
             return "5K 60 Experimental"
+        case .native4_5kRaw60:
+            return "iMac 4.5K DPCM"
         case .native5kRaw60:
             return "5K DPCM"
         }
@@ -79,10 +86,14 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return "3840 × 2160 @ 60"
         case .retina4k60:
             return "4096 × 2304 @ 60"
+        case .retina4_5k60:
+            return "4480 × 2520 @ 60"
         case .native5k:
             return "5120 × 2880 @ 48"
         case .native5k60Experimental:
             return "5120 × 2880 @ 60"
+        case .native4_5kRaw60:
+            return "4480 × 2520 @ 60 · experimental"
         case .native5kRaw60:
             return "5120 × 2880 @ 60 · experimental"
         }
@@ -100,6 +111,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 3840
         case .retina4k60:
             return 4096
+        case .retina4_5k60, .native4_5kRaw60:
+            return 4480
         case .native5k, .native5k60Experimental, .native5kRaw60:
             return 5120
         }
@@ -117,6 +130,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 2160
         case .retina4k60:
             return 2304
+        case .retina4_5k60, .native4_5kRaw60:
+            return 2520
         case .native5k, .native5k60Experimental, .native5kRaw60:
             return 2880
         }
@@ -136,13 +151,13 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 78_000_000
         case .crisp2160p60:
             return 105_000_000
-        case .retina4k60:
+        case .retina4k60, .retina4_5k60:
             return 120_000_000
         case .native5k:
             return 120_000_000
         case .native5k60Experimental:
             return 150_000_000
-        case .native5kRaw60:
+        case .native4_5kRaw60, .native5kRaw60:
             // Used only by the encoded compatibility fallback; TBD2 has no
             // target bitrate because it preserves every captured RGB sample.
             return 120_000_000
@@ -153,9 +168,9 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1080p, .smooth1080p60, .standard1440p, .smooth1440p60, .smooth1800p60:
             return "H.264"
-        case .crisp2160p60, .retina4k60, .native5k, .native5k60Experimental:
+        case .crisp2160p60, .retina4k60, .retina4_5k60, .native5k, .native5k60Experimental:
             return "HEVC"
-        case .native5kRaw60:
+        case .native4_5kRaw60, .native5kRaw60:
             // Requested transport. The session label uses the negotiated mode
             // so legacy fallback is not reported as DPCM.
             return "DPCM"
@@ -166,9 +181,9 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1080p, .smooth1080p60, .standard1440p, .smooth1440p60, .smooth1800p60:
             return kCMVideoCodecType_H264
-        case .crisp2160p60, .retina4k60, .native5k, .native5k60Experimental:
+        case .crisp2160p60, .retina4k60, .retina4_5k60, .native5k, .native5k60Experimental:
             return kCMVideoCodecType_HEVC
-        case .native5kRaw60:
+        case .native4_5kRaw60, .native5kRaw60:
             // Compatibility default; negotiation chooses DPCM, raw NV12 or a
             // supported hardware codec before capture starts.
             return kCMVideoCodecType_HEVC
@@ -179,7 +194,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
     /// the actual transport before capture starts.
     var isRawPassthrough: Bool {
         switch self {
-        case .native5kRaw60:
+        case .native4_5kRaw60, .native5kRaw60:
             return true
         default:
             return false
@@ -193,13 +208,14 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1080p, .standard1440p:
             return 3
-        case .smooth1080p60, .smooth1440p60, .smooth1800p60, .crisp2160p60, .retina4k60,
+        case .smooth1080p60, .smooth1440p60, .smooth1800p60, .crisp2160p60, .retina4k60, .retina4_5k60,
              .native5k, .native5k60Experimental:
             // Five surfaces protect WindowServer from starvation during
             // high-frame-rate 4K capture while the serial pipeline prevents an
             // application-side frame backlog.
             return 5
-        case .native5kRaw60:
+        case .native4_5kRaw60, .native5kRaw60:
+            // Use the 5K DPCM queue for both native iMac resolutions.
             // 8 at 5K, which is also ScreenCaptureKit's own default. Both numbers
             // are right at different resolutions and this is the boundary.
             //
@@ -226,11 +242,11 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 60
         case .smooth1800p60:
             return 60
-        case .crisp2160p60, .retina4k60:
+        case .crisp2160p60, .retina4k60, .retina4_5k60:
             return 60
         case .native5k:
             return 48
-        case .native5k60Experimental, .native5kRaw60:
+        case .native5k60Experimental, .native4_5kRaw60, .native5kRaw60:
             return 60
         }
     }
@@ -252,11 +268,11 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 60
         case .smooth1800p60:
             return 60
-        case .crisp2160p60, .retina4k60:
+        case .crisp2160p60, .retina4k60, .retina4_5k60:
             return 60
         case .native5k:
             return 48
-        case .native5k60Experimental, .native5kRaw60:
+        case .native5k60Experimental, .native4_5kRaw60, .native5kRaw60:
             return 60
         }
     }
@@ -271,9 +287,9 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 2
         case .smooth1440p60:
             return 1
-        case .smooth1800p60, .crisp2160p60, .retina4k60:
+        case .smooth1800p60, .crisp2160p60, .retina4k60, .retina4_5k60:
             return 1
-        case .native5k, .native5k60Experimental, .native5kRaw60:
+        case .native5k, .native5k60Experimental, .native4_5kRaw60, .native5kRaw60:
             return 1
         }
     }
@@ -282,8 +298,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1080p, .standard1440p:
             return false
-        case .smooth1080p60, .smooth1440p60, .smooth1800p60, .crisp2160p60, .retina4k60, .native5k,
-             .native5k60Experimental, .native5kRaw60:
+        case .smooth1080p60, .smooth1440p60, .smooth1800p60, .crisp2160p60, .retina4k60, .retina4_5k60, .native5k,
+             .native5k60Experimental, .native4_5kRaw60, .native5kRaw60:
             return true
         }
     }
@@ -299,8 +315,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1080p, .standard1440p:
             return 1
-        case .smooth1080p60, .smooth1440p60, .smooth1800p60, .crisp2160p60, .retina4k60, .native5k,
-             .native5k60Experimental, .native5kRaw60:
+        case .smooth1080p60, .smooth1440p60, .smooth1800p60, .crisp2160p60, .retina4k60, .retina4_5k60, .native5k,
+             .native5k60Experimental, .native4_5kRaw60, .native5kRaw60:
             return 0
         }
     }
@@ -309,8 +325,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1080p, .standard1440p:
             return false
-        case .smooth1080p60, .smooth1440p60, .smooth1800p60, .crisp2160p60, .retina4k60, .native5k,
-             .native5k60Experimental, .native5kRaw60:
+        case .smooth1080p60, .smooth1440p60, .smooth1800p60, .crisp2160p60, .retina4k60, .retina4_5k60, .native5k,
+             .native5k60Experimental, .native4_5kRaw60, .native5kRaw60:
             return true
         }
     }
@@ -326,8 +342,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1080p, .smooth1080p60, .standard1440p, .smooth1440p60, .smooth1800p60:
             return .nominal
-        case .crisp2160p60, .retina4k60, .native5k, .native5k60Experimental,
-             .native5kRaw60:
+        case .crisp2160p60, .retina4k60, .retina4_5k60, .native5k, .native5k60Experimental,
+             .native4_5kRaw60, .native5kRaw60:
             return .best
         }
     }
@@ -340,11 +356,11 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 60
         case .smooth1440p60, .smooth1800p60:
             return 60
-        case .crisp2160p60, .retina4k60:
+        case .crisp2160p60, .retina4k60, .retina4_5k60:
             return 60
         case .native5k:
             return 48
-        case .native5k60Experimental, .native5kRaw60:
+        case .native5k60Experimental, .native4_5kRaw60, .native5kRaw60:
             return 60
         }
     }
@@ -4055,7 +4071,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 guard isStreaming, !sessionAckSent else { return }
                 let sentFrames = self.pipeline?.sentFramesSnapshot ?? 0
                 TBLog.connection.error("capture: first-frame timeout preset=\(self.capturePreset.rawValue, privacy: .public) source=\(String(describing: self.captureSource), privacy: .public) connected=\(self.isConnected, privacy: .public) sentFrames=\(sentFrames, privacy: .public)")
-                if self.capturePreset == .retina4k60 || self.capturePreset == .native5k || self.capturePreset == .native5k60Experimental {
+                if self.activeCodecType == kCMVideoCodecType_HEVC {
                     setStatus(.hevcNoFrames)
                 } else {
                     setStatus(.noFirstFrame)

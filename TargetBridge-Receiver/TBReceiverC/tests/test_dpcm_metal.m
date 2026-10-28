@@ -229,6 +229,8 @@ int main(void) {
             test_decode(65, 65, 0);
             test_decode(65, 65, 1);
             test_cursor_shapes();
+            /* Full 4.5K frame, including the final partial group of 16 tiles. */
+            test_decode(4480, 2520, 1);
             test_decode(65, 65, 1);
             tb_metal_plane_set_hidden(1);
             assert(!tb_metal_plane_available() && !g.view);

@@ -241,6 +241,11 @@ int main(void) {
                                                 ten, pattern, unaligned);
                         ++checks;
                     }
+        // Native M1 iMac resolution leaves 16 tiles in the last 64-tile group.
+        for (int pattern = 0; pattern < 3; ++pattern) {
+            failures += check_frame(encoder, 4480, 2520, 1, pattern, 0);
+            ++checks;
+        }
         tb_dpcm_gpu_destroy(encoder);
         printf("GPU parity: %d frames, %d failures\n", checks, failures);
         return failures ? 1 : 0;

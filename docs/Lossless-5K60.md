@@ -1,10 +1,17 @@
 # Experimental 10-bit RGB DPCM transport
 
-`native5kRaw60` targets 5120 × 2880 at up to 60 FPS. It requests packed
+`native4_5kRaw60` (**iMac 4.5K DPCM**) targets 4480 × 2520, the
+[24-inch M1 iMac's native resolution](https://support.apple.com/en-gb/111895).
+`native5kRaw60` (**5K DPCM**) targets 5120 × 2880. Both target up to 60 FPS and request packed
 10-bit RGB (`l10r`, ARGB2101010 little endian) from ScreenCaptureKit and
-losslessly transmits the captured RGB samples using TBD2 tile-DPCM.
-This is an experimental transport, not a guarantee of sustained 5K60,
+losslessly transmit the captured RGB samples using TBD2 tile-DPCM.
+This is an experimental transport, not a guarantee of sustained 4.5K60 or 5K60,
 HDR, native 10-bit source content, or 10-bit panel scanout.
+
+For 1:1 capture, enable render matching in Extended Desktop: the 4.5K profile
+uses a 2240 × 1260 HiDPI desktop, and the 5K profile uses 2560 × 1440.
+The separate **iMac 4.5K** (`retina4_5k60`) preset uses the existing HEVC path;
+select **iMac 4.5K DPCM** to request 10-bit RGB capture.
 
 ## Capture and color contract
 
@@ -64,7 +71,7 @@ TBD2 splits frames into independent 8 × 8 tiles. Each tile stores its first
 pixel and per-channel residual widths. Remaining pixels predict from the left,
 except the first column which predicts from above. Modular residuals and zigzag
 coding preserve samples exactly at either supported codec depth (8 or 10 bits).
-The current Sender DPCM preset accepts only 10-bit capture.
+The current Sender DPCM presets accept only 10-bit capture.
 
 Groups of 64 tiles share an offset table. The CPU parser checks dimensions,
 widths, payload sizes and group offsets before the Metal decoder accesses the
@@ -104,13 +111,15 @@ make test-dpcm-gpu
 ```
 
 The GPU test compares 8-bit and 10-bit GPU output with the CPU reference, injects GPU creation/submission failures, then
-checks decoded pixels, padded rows and partial tiles. It requires a usable
+checks decoded pixels, padded rows, partial tiles and full 4480 × 2520 frames.
+It requires a usable
 Metal device; exit 77 means unavailable, not a passing GPU test.
 
 For receiver decode and presentation with synthetic pixels, run
 `make test-dpcm-metal`. This requires SDL2 and a logged-in GUI session, opens a
 small test window, compares GPU decoded buffers with the CPU reference, and
-checks first-frame visibility, teardown and oversized-frame rejection. It does
+checks first-frame visibility, teardown, oversized-frame rejection and native
+4.5K decode readback (including its final partial group). It does
 not capture the screen or change display settings.
 
 Sender XCTest coverage checks capability combinations, the actual SCStream
