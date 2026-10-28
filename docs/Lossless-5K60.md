@@ -164,13 +164,23 @@ this on one GPU does not establish that a different receiver can decode the
 actual stream. The hardware-free diagnostic regression is
 `python3 tests/test_video_diagnostics.py` from `TargetBridge-Receiver/TBReceiverC`.
 
-DPCM reports mean encode-plus-packet time and packet size every 120 sent frames,
+DPCM reports mean encode-plus-packet time, synchronous send-call time
+(`meanSendCallMS`) and packet size every 120 sent frames,
 alongside cumulative capture, pacing and pre-encode drop counters. The latter
 includes rejected frames as well as a full queue; correlate it with error logs. Use those
 to distinguish capture cadence, encoding work and a full send queue; a cable
 speed or FPS number alone does not identify the bottleneck. Packet construction
-copies the encoded bytes once into owned memory; subsequent GPU frames cannot
-overwrite packets still being sent.
+copies the encoded bytes once into owned `DispatchData`; subsequent GPU frames
+cannot overwrite packets still being sent. The public Network `DataProtocol`
+send overload accepts that storage directly, avoiding the extra full-frame copy
+observed when passing Swift `Data`. Encode-plus-packet timing alone does not
+include the send call or establish end-to-end latency.
+
+The three-packet budget is released directly by Network completion under a
+separate lock. Deferring that update onto the capture queue could falsely drop
+queued frames after Network had already processed the preceding submissions.
+The budget still rejects new frames when transport processing is actually
+pending; it does not imply receiver presentation or TCP acknowledgement.
 
 The Sender's monitor details show actual DPCM dimensions, submitted video Gbps,
 average MB/frame, compression relative to packed 32-bit capture, encoding time,

@@ -3,6 +3,7 @@ import CoreGraphics
 import CoreMedia
 import CoreVideo
 import Darwin
+import Dispatch
 import Foundation
 import AVFoundation
 import IOSurface
@@ -95,6 +96,38 @@ struct TBVideoSubmissionStatistics {
             meanEncodePacketMS: frames > 0 ? encodeSeconds * 1000 / frames : nil,
             usesGPU: current.usesGPU)
         return rate
+    }
+}
+
+/// Network completions must release capacity immediately, even while capture
+/// callbacks are queued or encoding on the pipeline's serial queue. Each
+/// pipeline owns one budget; completions retain only that budget through stop.
+final class TBVideoPacketBudget: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending = 0
+
+    var snapshot: Int {
+        lock.lock(); defer { lock.unlock() }
+        return pending
+    }
+
+    func tryReserve(limit: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard pending < min(64, max(1, limit)) else { return false }
+        pending += 1
+        return true
+    }
+
+    /// VT admission already reserves capacity in inFlightEncodeFrames on the
+    /// serial queue. Transfer that reservation without dropping a reference frame.
+    func recordEncodedSubmission() {
+        lock.lock(); defer { lock.unlock() }
+        pending += 1
+    }
+
+    func release() {
+        lock.lock(); defer { lock.unlock() }
+        pending = max(0, pending - 1)
     }
 }
 
@@ -577,10 +610,16 @@ final class TBDPCMFrameEncoder {
         }
     }
 
+    func encodeDispatchPacket(_ pixelBuffer: CVPixelBuffer) -> DispatchData? {
+        withEncodedBytes(pixelBuffer) {
+            TBMonitorProtocol.makeDispatchPacket(type: .rawDPCM, payloadBytes: $0)
+        }
+    }
+
     /// The payload is borrowed only for this synchronous closure. Construct an
     /// owned result before unlocking capture or reusing either encoder buffer.
-    private func withEncodedBytes(_ pixelBuffer: CVPixelBuffer,
-                                  makeOwnedData: (UnsafeBufferPointer<UInt8>) -> Data) -> Data? {
+    private func withEncodedBytes<OwnedData>(_ pixelBuffer: CVPixelBuffer,
+                                            makeOwnedData: (UnsafeBufferPointer<UInt8>) -> OwnedData) -> OwnedData? {
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
         let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
@@ -825,10 +864,12 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private let usesRawNV12: Bool
     private let onFirstFrame: @Sendable () -> Void
 
-    // Confined to `queue`.
+    // Encoder/capture state is confined to `queue`; packet capacity is shared
+    // with Network completions through its own locked budget.
     private var vtEncoder: VTCompressionSession?
     private var vtEncoderRef: Unmanaged<TBVideoPipeline>?
-    private var pendingVideoPackets = 0
+    private let videoPacketBudget = TBVideoPacketBudget()
+    private var pendingVideoPackets: Int { videoPacketBudget.snapshot }
     private var inFlightEncodeFrames = 0
     private var displayStreamFrameSequence: CMTimeValue = 0
     private var lastEncodedDisplayPTS: CMTime?
@@ -840,6 +881,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var dpcmMeasuredFrames = 0
     private var dpcmMeasuredBytes = 0
     private var dpcmMeasuredSeconds: Double = 0
+    private var dpcmMeasuredSendSeconds: Double = 0
 
     // Read from the main thread (fps timer / watchdog); guarded by `lock`.
     private let lock = NSLock()
@@ -1186,12 +1228,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 loggedFirstEncodedFrame = true
                 TBLog.connection.info("encoder: first packet bytes=\(packet.count) keyframe=\(isKeyframe) codec=\(self.codecType)")
             }
-            pendingVideoPackets += 1
-            connection.send(content: packet, completion: .contentProcessed({ [weak self] _ in
-                guard let self else { return }
-                self.queue.async {
-                    self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
-                }
+            videoPacketBudget.recordEncodedSubmission()
+            connection.send(content: packet, completion: .contentProcessed({ [budget = videoPacketBudget] _ in
+                budget.release()
             }))
             recordVideoSubmission(packetBytes: packet.count)
         }
@@ -1218,15 +1257,17 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private func sendDPCMFrame(_ sampleBuffer: CMSampleBuffer) {
         guard running, dpcmEnabled,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        if pendingVideoPackets >= preset.maxPendingVideoPackets {
+        guard videoPacketBudget.tryReserve(limit: preset.maxPendingVideoPackets) else {
             droppedBeforeEncodeFrames += 1
             return
         }
+        var submitted = false
+        defer { if !submitted { videoPacketBudget.release() } }
         if dpcmEncoder == nil {
             dpcmEncoder = TBDPCMFrameEncoder(adaptiveColor: dpcmAdaptiveColorEnabled)
         }
         let encodeStarted = ProcessInfo.processInfo.systemUptime
-        guard let packet = dpcmEncoder?.encodePacket(pixelBuffer) else {
+        guard let packet = dpcmEncoder?.encodeDispatchPacket(pixelBuffer) else {
             droppedBeforeEncodeFrames += 1
             if !loggedInvalidDPCMFrame {
                 loggedInvalidDPCMFrame = true
@@ -1240,24 +1281,25 @@ private final class TBVideoPipeline: @unchecked Sendable {
             TBLog.connection.info("dpcm: captured l10r RGB 10-bit, Display P3 requested, width=\(CVPixelBufferGetWidth(pixelBuffer)) height=\(CVPixelBufferGetHeight(pixelBuffer)) adaptiveColor=\(self.dpcmAdaptiveColorEnabled)")
         }
         acknowledgeFirstFrame()
+        submitted = true
+        let sendStarted = ProcessInfo.processInfo.systemUptime
+        connection.send(content: packet, completion: .contentProcessed({ [budget = videoPacketBudget] _ in
+            budget.release()
+        }))
+        dpcmMeasuredSendSeconds += ProcessInfo.processInfo.systemUptime - sendStarted
         dpcmMeasuredFrames += 1
         dpcmMeasuredBytes += packet.count
         dpcmMeasuredSeconds += encodePacketSeconds
         if dpcmMeasuredFrames == 120 {
             let meanMS = dpcmMeasuredSeconds * 1000 / Double(dpcmMeasuredFrames)
+            let meanSendMS = dpcmMeasuredSendSeconds * 1000 / Double(dpcmMeasuredFrames)
             let meanBytes = dpcmMeasuredBytes / dpcmMeasuredFrames
-            TBLog.connection.info("dpcm: sample frames=120 meanEncodePacketMS=\(meanMS) meanPacketBytes=\(meanBytes) captured=\(self.capturedFrames) droppedPacing=\(self.droppedByFrameRatePacer) droppedBackpressure=\(self.droppedBeforeEncodeFrames) pending=\(self.pendingVideoPackets)")
+            TBLog.connection.info("dpcm: sample frames=120 meanEncodePacketMS=\(meanMS) meanSendCallMS=\(meanSendMS) meanPacketBytes=\(meanBytes) captured=\(self.capturedFrames) droppedPacing=\(self.droppedByFrameRatePacer) droppedBackpressure=\(self.droppedBeforeEncodeFrames) pending=\(self.pendingVideoPackets)")
             dpcmMeasuredFrames = 0
             dpcmMeasuredBytes = 0
             dpcmMeasuredSeconds = 0
+            dpcmMeasuredSendSeconds = 0
         }
-        pendingVideoPackets += 1
-        connection.send(content: packet, completion: .contentProcessed({ [weak self] _ in
-            guard let self else { return }
-            self.queue.async {
-                self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
-            }
-        }))
         recordVideoSubmission(packetBytes: packet.count, dpcm: .init(
             width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer),
             encodePacketSeconds: encodePacketSeconds, usesGPU: dpcmEncoder?.usesGPU ?? false))
@@ -1269,10 +1311,12 @@ private final class TBVideoPipeline: @unchecked Sendable {
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
         // Backpressure: never pile frames on top of a network that can't keep up.
-        if pendingVideoPackets >= preset.maxPendingVideoPackets {
+        guard videoPacketBudget.tryReserve(limit: preset.maxPendingVideoPackets) else {
             droppedBeforeEncodeFrames += 1
             return
         }
+        var submitted = false
+        defer { if !submitted { videoPacketBudget.release() } }
         guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
               CVPixelBufferGetPlaneCount(pixelBuffer) == 2 else { return }
 
@@ -1314,12 +1358,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
         payload.append(UnsafeBufferPointer(start: uvBase.assumingMemoryBound(to: UInt8.self), count: uvSize))
 
         let packet = TBMonitorProtocol.makePacket(type: .rawFrame, payload: payload)
-        pendingVideoPackets += 1
-        connection.send(content: packet, completion: .contentProcessed({ [weak self] _ in
-            guard let self else { return }
-            self.queue.async {
-                self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
-            }
+        submitted = true
+        connection.send(content: packet, completion: .contentProcessed({ [budget = videoPacketBudget] _ in
+            budget.release()
         }))
         recordVideoSubmission(packetBytes: packet.count)
     }

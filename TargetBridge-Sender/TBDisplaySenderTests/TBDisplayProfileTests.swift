@@ -2,6 +2,7 @@ import XCTest
 import CoreVideo
 import CoreGraphics
 import ScreenCaptureKit
+import Dispatch
 @testable import TargetBridge
 
 final class TBDisplayProfileTests: XCTestCase {
@@ -121,6 +122,7 @@ final class TBDPCMTransportTests: XCTestCase {
         for pixelBuffer in invalidBuffers {
             XCTAssertNil(encoder.encode(pixelBuffer))
             XCTAssertNil(encoder.encodePacket(pixelBuffer))
+            XCTAssertNil(encoder.encodeDispatchPacket(pixelBuffer))
         }
     }
 
@@ -170,7 +172,7 @@ final class TBDPCMTransportTests: XCTestCase {
         let pixelBuffer = try buffer(format: kCVPixelFormatType_ARGB2101010LEPacked,
                                      width: width, height: height)
         var encoder: TBDPCMFrameEncoder? = TBDPCMFrameEncoder(useGPU: useGPU, adaptiveColor: adaptiveColor)
-        var retained: [(packet: Data, pixels: Data)] = []
+        var retained: [(packet: Data, dispatchPacket: DispatchData, pixels: Data)] = []
         for frame in 0..<8 {
             XCTAssertEqual(CVPixelBufferLockBaseAddress(pixelBuffer, []), kCVReturnSuccess)
             let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(pixelBuffer))
@@ -187,14 +189,19 @@ final class TBDPCMTransportTests: XCTestCase {
                 pixels.append(base.advanced(by: y * stride).assumingMemoryBound(to: UInt8.self), count: width * 4)
             }
             CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
-            retained.append((try XCTUnwrap(encoder?.encodePacket(pixelBuffer)), pixels))
+            retained.append((try XCTUnwrap(encoder?.encodePacket(pixelBuffer)),
+                             try XCTUnwrap(encoder?.encodeDispatchPacket(pixelBuffer)), pixels))
             for snapshot in retained {
                 try assertPacket(snapshot.packet, decodesTo: snapshot.pixels, width: width, height: height)
+                XCTAssertEqual(Data(snapshot.dispatchPacket), snapshot.packet)
+                try assertPacket(Data(snapshot.dispatchPacket), decodesTo: snapshot.pixels, width: width, height: height)
             }
         }
         encoder = nil
         for snapshot in retained {
             try assertPacket(snapshot.packet, decodesTo: snapshot.pixels, width: width, height: height)
+            XCTAssertEqual(Data(snapshot.dispatchPacket), snapshot.packet)
+            try assertPacket(Data(snapshot.dispatchPacket), decodesTo: snapshot.pixels, width: width, height: height)
         }
     }
 

@@ -1,4 +1,5 @@
 import Foundation
+import Dispatch
 
 enum TBMonitorPacketType: UInt8 {
     case helloReceiver = 0x10
@@ -164,6 +165,23 @@ enum TBMonitorProtocol {
         packet.append(type.rawValue)
         if let base = payloadBytes.baseAddress {
             packet.append(base, count: payloadBytes.count)
+        }
+        return packet
+    }
+
+    /// Own the borrowed payload before the encoder reuses its storage. Keeping
+    /// the header and copied payload as DispatchData regions lets Network's
+    /// public DataProtocol send overload avoid bridging Data through NSData.
+    static func makeDispatchPacket(type: TBMonitorPacketType,
+                                   payloadBytes: UnsafeBufferPointer<UInt8>) -> DispatchData {
+        var header = Data(capacity: 5)
+        appendBE32(&header, UInt32(1 + payloadBytes.count))
+        header.append(type.rawValue)
+        var packet = header.withUnsafeBytes { DispatchData(bytes: $0) }
+        if !payloadBytes.isEmpty {
+            // This initializer copies synchronously; bytesNoCopy is unsafe for
+            // the encoder's reusable GPU/CPU output allocation.
+            packet.append(DispatchData(bytes: UnsafeRawBufferPointer(payloadBytes)))
         }
         return packet
     }

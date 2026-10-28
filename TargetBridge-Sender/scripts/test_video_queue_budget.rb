@@ -50,3 +50,5 @@ Dir.mktmpdir('tb-video-budget.') do |dir|
   abort 'compile failed' unless system('swiftc', '-module-cache-path', File.join(dir, 'cache'), file, '-o', File.join(dir, 'test'))
   abort 'tests failed' unless system(File.join(dir, 'test'))
 end
+
+require_relative 'test_video_pending_completion'
