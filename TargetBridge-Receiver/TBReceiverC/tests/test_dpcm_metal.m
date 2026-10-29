@@ -200,6 +200,216 @@ static void test_cursor_orientation(void) {
     assert(memcmp((uint8_t *)result.contents + 256, colors + 2, 8) == 0);
 }
 
+/* Reserve permits to model older GPU submissions still owning their slots.
+ * Only failure boundaries are substituted; upload, decode and recovery use
+ * real Metal buffers and the production rendering entry points. */
+@interface TBRingFailDevice : NSObject
+@property(nonatomic) int attempts;
+@end
+@implementation TBRingFailDevice
+- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
+    (void)length; (void)options; ++_attempts; return nil;
+}
+@end
+
+@interface TBRingFailBuffer : NSObject
+@property(nonatomic, strong) id<MTLBuffer> real;
+@end
+@implementation TBRingFailBuffer
+- (id)forwardingTargetForSelector:(SEL)selector { return self.real; }
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+                                  offset:(NSUInteger)offset bytesPerRow:(NSUInteger)stride {
+    (void)descriptor; (void)offset; (void)stride; return nil;
+}
+@end
+
+@interface TBRingFailCommand : NSObject
+@property(nonatomic, strong) id<MTLCommandBuffer> real;
+@property(nonatomic) int failure;
+@end
+@implementation TBRingFailCommand
+- (id)forwardingTargetForSelector:(SEL)selector { return self.real; }
+- (void)addCompletedHandler:(MTLCommandBufferHandler)handler {
+    const int failure = self.failure;
+    [self.real addCompletedHandler:^(id<MTLCommandBuffer> command) {
+        fprintf(stderr, "injected command completion fault=%d status=%lu\n", failure, (unsigned long)command.status);
+        handler(command);
+    }];
+}
+- (id<MTLComputeCommandEncoder>)computeCommandEncoder {
+    return self.failure == 2 ? nil : [self.real computeCommandEncoder];
+}
+- (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)descriptor {
+    return self.failure == 3 ? nil : [self.real renderCommandEncoderWithDescriptor:descriptor];
+}
+@end
+
+@interface TBRingFailQueue : NSObject
+@property(nonatomic, strong) id<MTLCommandQueue> real;
+@property(nonatomic) int calls, failAt, failure, drained;
+@end
+@implementation TBRingFailQueue
+- (id<MTLCommandBuffer>)commandBuffer {
+    if (++_calls != self.failAt) return [self.real commandBuffer];
+    if (self.failure == 1) return nil;
+    if (self.failure == 4) {
+        while (dispatch_semaphore_wait(g.inflight, DISPATCH_TIME_NOW) == 0) ++_drained;
+    }
+    TBRingFailCommand *command = [TBRingFailCommand new];
+    command.real = [self.real commandBuffer];
+    command.failure = self.failure;
+    return (id<MTLCommandBuffer>)command;
+}
+@end
+
+static void ring_fence(id<MTLCommandQueue> queue) {
+    id<MTLCommandBuffer> command = [queue commandBuffer];
+    assert(command); [command commit]; [command waitUntilCompleted];
+    assert(command.status == MTLCommandBufferStatusCompleted);
+}
+
+static void assert_one_permit(dispatch_semaphore_t sem) {
+    assert(dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0);
+    assert(dispatch_semaphore_wait(sem, DISPATCH_TIME_NOW) != 0);
+    dispatch_semaphore_signal(sem);
+}
+
+static void assert_held_uploads(size_t bytes) {
+    for (int slot = 0; slot < TB_UPLOAD_RING - 1; ++slot) {
+        const uint8_t *held = g.ring[slot].contents;
+        for (size_t i = 0; i < bytes; ++i) assert(held[i] == 0x7f);
+    }
+}
+
+static void test_failed_upload_keeps_free_slot(void) {
+    id<MTLCommandQueue> queue = g.queue;
+    id<MTLDevice> device = g.dev;
+    CAMetalLayer *layer = g.layer;
+    ring_fence(queue);
+    tb_geometry_set(64, 4);
+    const size_t bytes = g.frame_bpr * 4;
+    for (int slot = 0; slot < TB_UPLOAD_RING - 1; ++slot) {
+        g.ring[slot] = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        assert(g.ring[slot]); g.ring_cap[slot] = bytes;
+        memset(g.ring[slot].contents, 0x7f, bytes);
+    }
+    dispatch_semaphore_t permits = g.inflight;
+    g.inflight = dispatch_semaphore_create(1);
+    const int free_slot = TB_UPLOAD_RING - 1;
+    g.ring_idx = free_slot;
+    g.ring[free_slot] = nil; g.ring_cap[free_slot] = 0;
+    uint32_t pixels[64 * 4]; memset(pixels, 0x31, sizeof pixels);
+    TBRingFailDevice *missing = [TBRingFailDevice new];
+    g.dev = (id<MTLDevice>)missing;
+    for (int retry = 0; retry < 4; ++retry) {
+        assert(tb_metal_plane_render_packed((uint8_t *)pixels, 256, 64, 4, 1) == -1);
+        assert(g.ring_idx == free_slot); assert_held_uploads(bytes); assert_one_permit(g.inflight);
+    }
+    assert(missing.attempts == 4); g.dev = device;
+    for (int failure = 0; failure < 4; ++failure) {
+        id<MTLBuffer> original = nil;
+        TBRingFailQueue *failed_queue = [TBRingFailQueue new];
+        failed_queue.real = queue; failed_queue.failAt = 1; failed_queue.failure = 3;
+        if (failure == 0) g.queue = nil;
+        if (failure == 1) g.layer = nil;
+        if (failure == 2) {
+            original = g.ring[free_slot];
+            TBRingFailBuffer *failed_buffer = [TBRingFailBuffer new]; failed_buffer.real = original;
+            g.ring[free_slot] = (id<MTLBuffer>)failed_buffer;
+        }
+        if (failure == 3) g.queue = (id<MTLCommandQueue>)failed_queue;
+        for (int retry = 0; retry < 8; ++retry) {
+            failed_queue.calls = 0;
+            assert(tb_metal_plane_render_packed((uint8_t *)pixels, 256, 64, 4, 1) == -1);
+            assert(g.ring_idx == free_slot); assert_held_uploads(bytes); assert_one_permit(g.inflight);
+        }
+        if (original) g.ring[free_slot] = original;
+        g.queue = queue; g.layer = layer;
+    }
+    assert(tb_metal_plane_render_packed((uint8_t *)pixels, 256, 64, 4, 1) == 0);
+    assert(g.ring_idx == 0);
+    ring_fence(queue); assert_one_permit(g.inflight); assert_held_uploads(bytes);
+    assert(memcmp(g.ring[free_slot].contents, pixels, sizeof pixels) == 0);
+    g.inflight = permits;
+    puts("Metal upload ring: allocation/command/drawable/texture/encoder failures preserve busy slots; recovery passed");
+}
+
+static void assert_held_frames(id<MTLCommandQueue> queue, size_t bytes) {
+    id<MTLBuffer> readback = [g.dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    assert(readback);
+    for (int slot = 0; slot < TB_FRAME_RING - 1; ++slot) {
+        id<MTLCommandBuffer> command = [queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
+        [blit copyFromBuffer:g.frame[slot] sourceOffset:0 toBuffer:readback destinationOffset:0 size:bytes];
+        [blit endEncoding]; [command commit]; [command waitUntilCompleted];
+        assert(command.status == MTLCommandBufferStatusCompleted);
+        const uint8_t *held = readback.contents;
+        for (size_t i = 0; i < bytes; ++i) assert(held[i] == 0x7f);
+    }
+}
+
+static void test_failed_frame_present_keeps_free_slot(void) {
+    id<MTLCommandQueue> queue = g.queue;
+    ring_fence(queue); tb_geometry_set(64, 4);
+    const size_t bytes = g.frame_bpr * 4;
+    id<MTLCommandBuffer> setup = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> fill = [setup blitCommandEncoder];
+    for (int slot = 0; slot < TB_FRAME_RING; ++slot) {
+        g.frame[slot] = [g.dev newBufferWithLength:bytes options:MTLResourceStorageModePrivate];
+        assert(g.frame[slot]); g.frame_cap[slot] = bytes;
+        [fill fillBuffer:g.frame[slot] range:NSMakeRange(0, bytes) value:0x7f];
+    }
+    [fill endEncoding]; [setup commit]; [setup waitUntilCompleted];
+    assert(setup.status == MTLCommandBufferStatusCompleted);
+    dispatch_semaphore_t frames = g.frames_free;
+    g.frames_free = dispatch_semaphore_create(1);
+    const int free_slot = TB_FRAME_RING - 1;
+    g.frame_widx = free_slot;
+    uint32_t pixels[64 * 4]; for (int i = 0; i < 64 * 4; ++i) pixels[i] = 0xc0100803u;
+    size_t capacity = tb_dpcm_max_size(64, 4);
+    uint8_t *blob = malloc(capacity); assert(blob);
+    size_t length = tb_dpcm_encode((uint8_t *)pixels, 256, 64, 4, 1, blob, capacity); assert(length);
+    /* Failure 1: decode command missing; 2: compute encoder missing;
+     * 3: present command missing; 4: render encoder missing;
+     * 5: no permit for presentation after a successful decode. */
+    for (int failure = 1; failure <= 5; ++failure) {
+        fprintf(stderr, "frame ring fault %d\n", failure);
+        TBRingFailQueue *failed = [TBRingFailQueue new]; failed.real = queue;
+        failed.failAt = failure <= 2 ? 1 : 2;
+        failed.failure = failure == 1 || failure == 3 ? 1 : failure == 2 ? 2 : failure == 4 ? 3 : 4;
+        g.queue = (id<MTLCommandQueue>)failed;
+        for (int retry = 0; retry < 6; ++retry) {
+            failed.calls = 0; failed.drained = 0;
+            const int upload = g.ring_idx;
+            assert(tb_metal_plane_render_dpcm(blob, length) == -1);
+            for (int i = 0; i < failed.drained; ++i) dispatch_semaphore_signal(g.inflight);
+            assert(g.frame_widx == free_slot && !g.frame_open);
+            assert(g.ring_idx == (failure <= 2 ? upload : (upload + 1) % TB_UPLOAD_RING));
+            assert_one_permit(g.frames_free); assert_held_frames(queue, bytes);
+        }
+    }
+    g.queue = queue;
+    fprintf(stderr, "frame ring recovery\n");
+    assert(tb_metal_plane_render_dpcm(blob, length) == 0);
+    assert(g.frame_widx == 0 && !g.frame_open);
+    ring_fence(queue); assert_one_permit(g.frames_free); assert_held_frames(queue, bytes);
+    id<MTLBuffer> recovered = [g.dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> readback = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> copy = [readback blitCommandEncoder];
+    assert(recovered && copy);
+    [copy copyFromBuffer:g.frame[free_slot] sourceOffset:0 toBuffer:recovered destinationOffset:0 size:bytes];
+    [copy endEncoding]; [readback commit]; [readback waitUntilCompleted];
+    assert(readback.status == MTLCommandBufferStatusCompleted);
+    assert(memcmp(recovered.contents, pixels, sizeof pixels) == 0);
+    for (int i = 0; i < TB_UPLOAD_RING; ++i)
+        assert(dispatch_semaphore_wait(g.inflight, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0);
+    assert(dispatch_semaphore_wait(g.inflight, DISPATCH_TIME_NOW) != 0);
+    for (int i = 0; i < TB_UPLOAD_RING; ++i) dispatch_semaphore_signal(g.inflight);
+    g.frames_free = frames;
+    free(blob);
+    puts("Metal frame ring: decode/present failures and exhausted presentation permits preserve busy surfaces; recovery passed");
+}
+
 static void test_resource_limit(void) {
     /* A valid flat 16K x 8K blob is only ~12 MB, but its decoded surface would
      * be 512 MiB. Reject it before geometry or either GPU ring is allocated. */
@@ -226,7 +436,10 @@ static void test_resource_limit(void) {
     free(blob);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    const int ring_only = argc == 2 && strcmp(argv[1], "--ring-upload-only") == 0 ? 1
+                        : argc == 2 && strcmp(argv[1], "--ring-frame-only") == 0 ? 2 : 0;
+    assert(argc == 1 || ring_only);
     @autoreleasepool {
         [NSApplication sharedApplication];
         uint8_t invalid[TB_DPCM_HEADER] = {0};
@@ -253,6 +466,14 @@ int main(void) {
             assert(tb_metal_plane_init(window) == 0);
             assert(!g.shown && g.layer.hidden && [(__bridge NSView *)g.view isHidden]);
             test_resource_limit();
+            if (ring_only) {
+                if (ring_only == 1) test_failed_upload_keeps_free_slot();
+                else test_failed_frame_present_keeps_free_slot();
+                tb_metal_plane_shutdown();
+                break;
+            }
+            test_failed_upload_keeps_free_slot();
+            test_failed_frame_present_keeps_free_slot();
             test_cursor_orientation();
             tb_metal_plane_set_cursor(32, 2, 1024, 4, 1, 0, 0);
             /* All 1024 values, including the low two bits, in every channel. */
@@ -288,7 +509,8 @@ int main(void) {
         SDL_DestroyRenderer(renderer);
         SDL_DestroyWindow(window);
         SDL_Quit();
-        puts("Metal DPCM: legacy/adaptive 8/10-bit CPU parity, mixed color tiles, all 1024 levels, partial tiles, 4.5K frames, hidden first frame, fallback/teardown, cursor shapes/size/hotspots and resource limits passed");
+        if (ring_only) puts("Metal selected ring failure/recovery regression passed");
+        else puts("Metal DPCM: legacy/adaptive 8/10-bit CPU parity, mixed color tiles, all 1024 levels, partial tiles, 4.5K frames, hidden first frame, fallback/teardown, cursor shapes/size/hotspots and resource limits passed");
     }
     return 0;
 }

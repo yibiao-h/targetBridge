@@ -1095,8 +1095,9 @@ static void tb_geometry_set(int w, int h) {
     fprintf(stderr, "[metal] drawable %dx%d\n", w, h);
 }
 
-/* Take an upload slot. The caller must signal `inflight` if it does not go on to
- * submit a command buffer that signals it on completion. */
+/* Take an upload slot without advancing past it. The caller advances only after
+ * submission, or returns `inflight` on failure so retries reuse the same free
+ * slot instead of wrapping into buffers still owned by earlier GPU work. */
 static id<MTLBuffer> tb_upload_take(size_t bytes) {
     /* Bounded for the same reason the frame-surface wait is: this runs on the
      * thread that services the window. Returning nil drops a band, which costs
@@ -1111,7 +1112,6 @@ static id<MTLBuffer> tb_upload_take(size_t bytes) {
         return nil;
     }
     int slot = g.ring_idx;
-    g.ring_idx = (g.ring_idx + 1) % TB_UPLOAD_RING;
     if (g.ring_cap[slot] < bytes) {
         g.ring[slot] = [g.dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
         g.ring_cap[slot] = g.ring[slot] ? bytes : 0;
@@ -1128,7 +1128,7 @@ static id<MTLBuffer> tb_upload_take(size_t bytes) {
  * VRAM buffer the decode kernel just wrote. Either way the shader samples those
  * bytes in place. */
 static int tb_present(id<MTLCommandBuffer> cb, id<MTLBuffer> src,
-                      MTLStorageMode mode, int ten_bit) {
+                      MTLStorageMode mode, int ten_bit, dispatch_semaphore_t frames) {
     if (!cb) { dispatch_semaphore_signal(g.inflight); return -1; }
     /* Timed because this is where vsync actually costs us: with
      * displaySyncEnabled the call blocks until a drawable frees. The mean tells
@@ -1205,6 +1205,7 @@ static int tb_present(id<MTLCommandBuffer> cb, id<MTLBuffer> src,
     [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull done) {
         (void)done;
         dispatch_semaphore_signal(sem);
+        if (frames) dispatch_semaphore_signal(frames);
     }];
     [cb commit];
     return 0;
@@ -1233,7 +1234,9 @@ int tb_metal_plane_render_packed(const uint8_t *px, int stride, int w, int h,
         }
 
         id<MTLCommandBuffer> cb = [g.queue commandBuffer];
-        return tb_present(cb, up, MTLStorageModeShared, ten_bit);
+        const int rc = tb_present(cb, up, MTLStorageModeShared, ten_bit, nil);
+        if (rc == 0) g.ring_idx = (g.ring_idx + 1) % TB_UPLOAD_RING;
+        return rc;
     }
 }
 
@@ -1386,6 +1389,7 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
             dispatch_semaphore_signal(sem);
         }];
         [cb commit];
+        g.ring_idx = (g.ring_idx + 1) % TB_UPLOAD_RING;
 
         if (!is_last) { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return 0; }
 
@@ -1414,7 +1418,6 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
         }
 
         const int presented_idx = g.frame_widx;
-        g.frame_widx = (g.frame_widx + 1) % TB_FRAME_RING;
         g.frame_open = 0;
 
         dispatch_semaphore_t frames = g.frames_free;
@@ -1422,11 +1425,9 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
         /* Match the texture view to the transmitted depth. Ten-bit samples
          * are presented without dithering so their low bits remain intact. */
         id<MTLCommandBuffer> pcb = [g.queue commandBuffer];
-        /* Releases the ring slot once the frame has actually been presented. */
-        [pcb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull done) {
-            (void)done;
-            dispatch_semaphore_signal(frames);
-        }];
+        /* tb_present registers the frame release only after all fallible setup.
+         * Metal can invoke a handler when an uncommitted command is destroyed;
+         * registering here would then double-release the failure path's slot. */
 
         /* tb_present releases an inflight count on completion, so take one —
          * bounded, like every other wait on this thread. */
@@ -1436,12 +1437,15 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
             dispatch_semaphore_signal(frames);
             { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return -1; }
         }
-        const int rc = tb_present(pcb, g.frame[presented_idx], MTLStorageModePrivate, in.ten_bit);
+        const int rc = tb_present(pcb, g.frame[presented_idx], MTLStorageModePrivate, in.ten_bit, frames);
         if (rc != 0) {
-            /* tb_present returns without committing when no drawable is free, so
-             * the handler above never runs and the ring slot would be lost —
-             * three of those and the next frame blocks forever. */
+            /* No presentation was committed and no frame-release handler was
+             * registered. Return the slot while keeping it next in the ring. */
             dispatch_semaphore_signal(frames);
+        } else {
+            /* Only a submitted presentation owns this slot. A failed attempt
+             * must retry it, not skip toward an older surface still in use. */
+            g.frame_widx = (g.frame_widx + 1) % TB_FRAME_RING;
         }
         { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return rc; }
     }
