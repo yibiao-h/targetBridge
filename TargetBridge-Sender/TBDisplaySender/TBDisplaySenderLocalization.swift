@@ -501,9 +501,15 @@ enum TBDisplaySenderL10n {
 
     static func codecPreferenceHint(
         _ preference: TBDisplayCodecPreference,
-        language: TBDisplaySenderLanguage
+        language: TBDisplaySenderLanguage,
+        preset: TBDisplayCapturePreset? = nil
     ) -> String {
-        text("sender.codec.hint.\(preference.rawValue)", language)
+        if preference == .automatic, let preset {
+            if preset.isRawPassthrough {
+                return text("sender.codec.hint.automatic.dpcm", language)
+            }
+        }
+        return text("sender.codec.hint.\(preference.rawValue)", language)
     }
 
     static func codecUnavailable(_ language: TBDisplaySenderLanguage) -> String {

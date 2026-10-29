@@ -39,6 +39,151 @@ final class TBDisplayProfileTests: XCTestCase {
     }
 }
 
+@MainActor
+final class TBCompressionPreferenceTests: XCTestCase {
+    func testDPCMCanBeSelectedForEveryPresetWithoutChangingSizeOrFrameRate() throws {
+        for preset in TBDisplayCapturePreset.allCases {
+            let transport = try XCTUnwrap(TBVideoTransport.resolve(
+                preference: .dpcm, preset: preset, supportsDPCM: true,
+                supportsRawNV12: true, rawOverride: true))
+            XCTAssertEqual(transport, .dpcm10Bit)
+            let configuration = SCStreamConfiguration()
+            configuration.width = preset.width
+            configuration.height = preset.height
+            let interval = CMTime(value: 1, timescale: CMTimeScale(preset.expectedFrameRate))
+            configuration.minimumFrameInterval = interval
+            transport.configureCapture(configuration)
+            XCTAssertEqual(configuration.width, preset.width)
+            XCTAssertEqual(configuration.height, preset.height)
+            XCTAssertEqual(configuration.minimumFrameInterval, interval)
+            XCTAssertEqual(configuration.pixelFormat, kCVPixelFormatType_ARGB2101010LEPacked)
+        }
+    }
+
+    func testExplicitDPCMRejectsMissingCapabilityWithoutFallingBackToNV12() {
+        for preset in TBDisplayCapturePreset.allCases {
+            for unsupported: Bool? in [nil, false] {
+                XCTAssertNil(TBVideoTransport.resolve(
+                    preference: .dpcm, preset: preset, supportsDPCM: unsupported,
+                    supportsRawNV12: true, rawOverride: true))
+            }
+        }
+    }
+
+    func testExplicitHardwareCodecOverridesDPCMPresetsAndRawOverride() {
+        for preset in TBDisplayCapturePreset.allCases {
+            for preference in [TBDisplayCodecPreference.h264, .hevc] {
+                for rawOverride in [false, true] {
+                    for support: Bool? in [nil, false, true] {
+                        XCTAssertEqual(TBVideoTransport.resolve(
+                            preference: preference, preset: preset, supportsDPCM: support,
+                            supportsRawNV12: support, rawOverride: rawOverride), .encoded)
+                    }
+                }
+            }
+        }
+    }
+
+    func testAutomaticKeepsLegacyDPCMFallbackOrderForOldReceivers() {
+        let peers: [(Bool?, Bool?, TBVideoTransport)] = [
+            (true, true, .dpcm10Bit), (true, nil, .dpcm10Bit),
+            (false, true, .rawNV12), (nil, true, .rawNV12),
+            (false, false, .encoded), (nil, nil, .encoded)
+        ]
+        for preset in [TBDisplayCapturePreset.native4_5kRaw60, .native5kRaw60] {
+            for (supportsDPCM, supportsRawNV12, expected) in peers {
+                for rawOverride in [false, true] {
+                    XCTAssertEqual(TBVideoTransport.resolve(
+                        preference: .automatic, preset: preset, supportsDPCM: supportsDPCM,
+                        supportsRawNV12: supportsRawNV12, rawOverride: rawOverride), expected)
+                }
+            }
+        }
+    }
+
+    func testAutomaticOrdinaryPresetsUseHardwareCodecUnlessLegacyNV12OverrideIsSupported() {
+        for preset in [TBDisplayCapturePreset.standard1080p, .retina4_5k60, .native5k] {
+            XCTAssertEqual(TBVideoTransport.resolve(
+                preference: .automatic, preset: preset, supportsDPCM: true,
+                supportsRawNV12: true), .encoded)
+            XCTAssertEqual(TBVideoTransport.resolve(
+                preference: .automatic, preset: preset, supportsDPCM: true,
+                supportsRawNV12: true, rawOverride: true), .rawNV12)
+            for unsupported: Bool? in [nil, false] {
+                XCTAssertEqual(TBVideoTransport.resolve(
+                    preference: .automatic, preset: preset, supportsDPCM: true,
+                    supportsRawNV12: unsupported, rawOverride: true), .encoded)
+            }
+        }
+    }
+
+    func testDPCMDoesNotSelectAHardwareEncoder() {
+        for preset in [TBDisplayCapturePreset.standard1080p, .native5kRaw60] {
+            for hardwareAvailable in [false, true] {
+                XCTAssertNil(TBDisplaySenderSession.chooseCodec(
+                    preference: .dpcm, preset: preset, receiverSupportsHEVC: hardwareAvailable,
+                    senderSupportsH264: hardwareAvailable, senderSupportsHEVC: hardwareAvailable))
+            }
+        }
+    }
+
+    func testLargeDPCMSelectionRetainsEightCaptureSurfaces() {
+        let override = ProcessInfo.processInfo.environment["QD"].flatMap(Int.init)
+        for preset in [TBDisplayCapturePreset.retina4_5k60, .native5k, .native5k60Experimental] {
+            XCTAssertEqual(TBVideoTransport.dpcm10Bit.captureQueueDepth(for: preset), override ?? 8)
+            XCTAssertEqual(TBVideoTransport.encoded.captureQueueDepth(for: preset), preset.queueDepth)
+        }
+        XCTAssertEqual(TBVideoTransport.dpcm10Bit.captureQueueDepth(for: .standard1080p),
+                       TBDisplayCapturePreset.standard1080p.queueDepth)
+    }
+
+    func testSavedCodecPreferencesRoundTripWithoutChangingExistingValues() throws {
+        let preferences: [(String, TBDisplayCodecPreference)] = [
+            ("automatic", .automatic), ("h264", .h264), ("hevc", .hevc), ("dpcm", .dpcm)
+        ]
+        XCTAssertEqual(TBDisplayCodecPreference.allCases, preferences.map(\.1))
+        for (value, preference) in preferences {
+            XCTAssertEqual(TBDisplayCodecPreference(rawValue: value), preference)
+            let encoded = try JSONEncoder().encode(preference)
+            XCTAssertEqual(String(decoding: encoded, as: UTF8.self), "\"\(value)\"")
+            XCTAssertEqual(try JSONDecoder().decode(TBDisplayCodecPreference.self, from: encoded), preference)
+        }
+    }
+
+    @MainActor
+    func testIdlePreviewFollowsCompressionAcrossPresetSourceAndLanguageChanges() {
+        let session = TBDisplaySenderSession(language: .english, largeCursor: false,
+                                            preventDisplaySleep: false, autoRestartOnWake: false,
+                                            audioEnabled: false)
+        session.codecPreference = .dpcm
+        XCTAssertTrue(session.streamResolutionText.contains("DPCM RGB 10-bit"))
+        session.capturePreset = .retina4_5k60
+        session.captureSource = .extendedDesktop
+        session.language = .chinese
+        XCTAssertTrue(session.streamResolutionText.contains("DPCM RGB 10-bit"))
+        session.capturePreset = .native5kRaw60
+        session.codecPreference = .h264
+        XCTAssertTrue(session.streamResolutionText.contains("H.264"))
+        XCTAssertEqual(TBDisplayCodecPreference.dpcm.requestedTransport(for: .retina4_5k60), .dpcm10Bit)
+        XCTAssertEqual(TBDisplayCodecPreference.h264.requestedTransport(for: .native5kRaw60), .encoded)
+    }
+
+    func testDPCMMenuHintsAndErrorsAreLocalizedAndFourPointFiveKNamesAreGeneric() {
+        for language in TBDisplaySenderLanguage.allCases {
+            for key in ["sender.codec.dpcm", "sender.codec.hint.dpcm", "sender.error.dpcm_unavailable"] {
+                let value = TBDisplaySenderL10n.text(key, language)
+                XCTAssertFalse(value.isEmpty)
+                XCTAssertNotEqual(value, key)
+            }
+            XCTAssertEqual(TBDisplaySenderL10n.codecPreferenceHint(
+                .automatic, language: language, preset: .native5kRaw60),
+                TBDisplaySenderL10n.text("sender.codec.hint.automatic.dpcm", language))
+            XCTAssertFalse(TBDisplayCapturePreset.retina4_5k60.title(language).contains("iMac"))
+            XCTAssertFalse(TBDisplayCapturePreset.native4_5kRaw60.title(language).contains("iMac"))
+        }
+    }
+}
+
 final class TBDPCMTransportTests: XCTestCase {
     func testNegotiationDoesNotSendNewPacketsToOldReceivers() {
         XCTAssertEqual(TBVideoTransport.resolve(wantsDPCM: true, supportsDPCM: true,

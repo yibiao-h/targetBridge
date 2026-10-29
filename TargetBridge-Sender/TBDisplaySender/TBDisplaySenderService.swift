@@ -178,13 +178,13 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         case .retina4k60:
             return "Retina 4K"
         case .retina4_5k60:
-            return "iMac 4.5K"
+            return "4.5K"
         case .native5k:
             return "5K"
         case .native5k60Experimental:
             return "5K 60 Experimental"
         case .native4_5kRaw60:
-            return "iMac 4.5K DPCM"
+            return "4.5K DPCM"
         case .native5kRaw60:
             return "5K DPCM"
         }
@@ -535,6 +535,30 @@ enum TBVideoTransport: Equatable {
     case rawNV12
     case dpcm10Bit
 
+    /// Explicit DPCM requires receiver support; automatic retains the legacy
+    /// preset fallback so older receivers can still use NV12 or a video codec.
+    static func resolve(preference: TBDisplayCodecPreference, preset: TBDisplayCapturePreset,
+                        supportsDPCM: Bool?, supportsRawNV12: Bool?,
+                        rawOverride: Bool = false) -> Self? {
+        switch preference {
+        case .dpcm:
+            return supportsDPCM == true ? .dpcm10Bit : nil
+        case .h264, .hevc:
+            return .encoded
+        case .automatic:
+            return resolve(wantsDPCM: preset.isRawPassthrough, supportsDPCM: supportsDPCM,
+                           supportsRawNV12: supportsRawNV12, rawOverride: rawOverride)
+        }
+    }
+
+    func captureQueueDepth(for preset: TBDisplayCapturePreset) -> Int {
+        if let value = ProcessInfo.processInfo.environment["QD"], let depth = Int(value) { return depth }
+        // Keep the tested 4.5K/5K DPCM depth when compression is selected
+        // independently of the legacy combined presets.
+        if self == .dpcm10Bit, preset.width >= 4480 { return 8 }
+        return preset.queueDepth
+    }
+
     static func resolve(wantsDPCM: Bool, supportsDPCM: Bool?,
                         supportsRawNV12: Bool?, rawOverride: Bool) -> Self {
         if wantsDPCM && supportsDPCM == true { return .dpcm10Bit }
@@ -711,8 +735,27 @@ enum TBDisplayCodecPreference: String, CaseIterable, Identifiable, Codable {
     case automatic
     case h264
     case hevc
+    case dpcm
 
     var id: String { rawValue }
+
+    func requestedTransport(for preset: TBDisplayCapturePreset) -> TBVideoTransport {
+        switch self {
+        case .dpcm: return .dpcm10Bit
+        case .h264, .hevc: return .encoded
+        case .automatic:
+            return preset.isRawPassthrough ? .dpcm10Bit : .encoded
+        }
+    }
+
+    func requestedCodecName(for preset: TBDisplayCapturePreset) -> String {
+        switch self {
+        case .h264: return "H.264"
+        case .hevc: return "HEVC"
+        case .automatic: return preset.codecName
+        case .dpcm: return requestedTransport(for: preset).codecName(encoded: preset.codecName)
+        }
+    }
 }
 
 struct TBDisplayCodecDecision: Equatable {
@@ -1719,25 +1762,21 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     @Published var capturePreset: TBDisplayCapturePreset = .standard1440p {
         didSet {
             if !isStreaming {
-                streamResolutionText = TBDisplaySenderL10n.streamSummary(preset: capturePreset, source: captureSource, language: language)
+                refreshConfiguredStreamSummary()
             }
         }
     }
     @Published var codecPreference: TBDisplayCodecPreference = .automatic {
         didSet {
             if !isStreaming {
-                streamResolutionText = TBDisplaySenderL10n.streamSummary(
-                    preset: capturePreset,
-                    source: captureSource,
-                    language: language
-                )
+                refreshConfiguredStreamSummary()
             }
         }
     }
     @Published var captureSource: TBDisplayCaptureSource = .desktopMirror {
         didSet {
             if !isStreaming {
-                streamResolutionText = TBDisplaySenderL10n.streamSummary(preset: capturePreset, source: captureSource, language: language)
+                refreshConfiguredStreamSummary()
             }
         }
     }
@@ -1936,6 +1975,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             preferredCodec = kCMVideoCodecType_H264
         case .hevc:
             preferredCodec = kCMVideoCodecType_HEVC
+        case .dpcm:
+            return nil
         }
 
         if preferredCodec == kCMVideoCodecType_HEVC, hevcAvailable {
@@ -1958,6 +1999,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         for preset: TBDisplayCapturePreset,
         profile: TBMonitorDisplayProfile?
     ) -> TBDisplayCodecDecision? {
+        guard codecPreference != .dpcm else { return nil }
         let receiverSupportsHEVC = profile?.supportsHEVCDecode
             ?? receiverSupportsHEVCDecodeHint
             ?? false
@@ -1986,13 +2028,30 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         codecType == kCMVideoCodecType_HEVC ? "HEVC" : "H.264"
     }
 
+    private func resolvedTransport(for profile: TBMonitorDisplayProfile?) -> TBVideoTransport? {
+        TBVideoTransport.resolve(preference: codecPreference, preset: capturePreset,
+                                 supportsDPCM: profile?.supportsDPCM,
+                                 supportsRawNV12: profile?.supportsRawNV12,
+                                 rawOverride: profile.map { rawNV12Enabled(for: $0) } ?? false)
+    }
+
+    private var unsupportedTransportMessage: String {
+        TBDisplaySenderL10n.text("sender.error.dpcm_unavailable", language)
+    }
+
+    private func refreshConfiguredStreamSummary() {
+        streamResolutionText = TBDisplaySenderL10n.streamSummary(
+            preset: capturePreset, source: captureSource, language: language,
+            codecName: codecPreference.requestedCodecName(for: capturePreset))
+    }
+
     private func refreshLocalizedText() {
         statusText = statusState.text(language)
         streamResolutionText = TBDisplaySenderL10n.streamSummary(
             preset: capturePreset,
             source: captureSource,
             language: language,
-            codecName: activeCodecName
+            codecName: activeCodecName ?? codecPreference.requestedCodecName(for: capturePreset)
         )
 
         if let profile = activeProfile {
@@ -2485,11 +2544,13 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private func sendHello() {
         let name = Host.current().localizedName ?? "MacBook"
         let preset = capturePreset
-        let helloCodecType = resolvedCodecType(for: preset, profile: activeProfile)
-        let transport = TBVideoTransport.resolve(
-            wantsDPCM: preset.isRawPassthrough, supportsDPCM: activeProfile?.supportsDPCM,
-            supportsRawNV12: activeProfile?.supportsRawNV12,
-            rawOverride: activeProfile.map { rawNV12Enabled(for: $0) } ?? false)
+        // Before the peer advertises capabilities, describe the requested mode.
+        // Once its profile arrives, the same resolver drives hello and capture.
+        let transport = activeProfile.flatMap { resolvedTransport(for: $0) }
+            ?? codecPreference.requestedTransport(for: preset)
+        let helloCodecName = transport == .encoded
+            ? codecName(for: resolvedCodecType(for: preset, profile: activeProfile))
+            : transport.codecName(encoded: "")
         guard let packet = TBMonitorProtocol.makeJSONPacket(
             type: .helloReceiver,
             value: TBMonitorHelloReceiver(
@@ -2499,7 +2560,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 captureSource: captureSource.title(language),
                 captureWidth: preset.width,
                 captureHeight: preset.height,
-                codec: transport.codecName(encoded: codecName(for: helloCodecType))
+                codec: helloCodecName
             )
         ) else { return }
         send(packet)
@@ -3058,6 +3119,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         else { return }
         let generation = captureRestartGeneration
 
+        if !isCableTestConnection && resolvedTransport(for: profile) == nil {
+            stop(resetStatusTo: .captureError(unsupportedTransportMessage))
+            return
+        }
+
         activeProfile = profile
         if let supportsHEVCDecode = profile.supportsHEVCDecode {
             receiverSupportsHEVCDecodeHint = supportsHEVCDecode
@@ -3226,9 +3292,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             }
 
             let preset = capturePreset
-            let transport = TBVideoTransport.resolve(
-                wantsDPCM: preset.isRawPassthrough, supportsDPCM: profile.supportsDPCM,
-                supportsRawNV12: profile.supportsRawNV12, rawOverride: rawNV12Enabled(for: profile))
+            guard let transport = resolvedTransport(for: profile) else {
+                setStatus(.captureError(unsupportedTransportMessage))
+                return false
+            }
             let usesRawNV12 = transport == .rawNV12
             let codecDecision: TBDisplayCodecDecision
             if transport != .encoded {
@@ -3318,7 +3385,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             configuration.width = preset.width
             configuration.height = preset.height
             configuration.minimumFrameInterval = CMTime(value: 1, timescale: Int32(preset.captureRequestFrameRate))
-            configuration.queueDepth = preset.queueDepth
+            configuration.queueDepth = transport.captureQueueDepth(for: preset)
             transport.configureCapture(configuration)
             configuration.shouldBeOpaque = true
             configuration.showsCursor = !usesCursorOverlay
@@ -4299,7 +4366,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         firstFrameTimer?.invalidate()
         firstFrameTimer = nil
         TBLog.connection.info("capture: first encoded frame received")
-        setStatus(.captureActive(capturePreset.description, activeCodecName ?? capturePreset.codecName, captureSource))
+        setStatus(.captureActive(capturePreset.description,
+                                 activeCodecName ?? codecPreference.requestedCodecName(for: capturePreset), captureSource))
     }
 
     private func startFPSTimer() {

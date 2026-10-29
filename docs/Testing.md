@@ -135,6 +135,14 @@ version, receiver model, cable type, and selected transport with the report.
 
 ## Experimental DPCM transport
 
+Select **DPCM RGB 10-bit (lossless)** in **Video compression** to use DPCM with
+any stream profile while keeping its resolution and frame rate. The receiver
+must advertise DPCM support; an explicit DPCM choice reports an error instead
+of silently switching transports. **Automatic** preserves the legacy DPCM
+profiles’ NV12 or hardware-codec fallback for older receivers. Explicit H.264
+or HEVC overrides a DPCM profile’s default compression. The choice is saved
+per receiver. Sustained frame rate still depends on both Macs and the link.
+
 `make test` also runs the hardware-free TBD2 reference codec suite at 8 and
 10 bits, including all 1024 RGB channel values. The Sender unit tests cover
 capability negotiation, `l10r`/Display P3 capture configuration, invalid buffer

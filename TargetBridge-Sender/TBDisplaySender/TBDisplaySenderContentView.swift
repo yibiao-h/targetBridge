@@ -680,7 +680,8 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                         TBDisplaySenderL10n.videoCompression(service.language),
                         details: TBDisplaySenderL10n.codecPreferenceHint(
                             session.codecPreference,
-                            language: service.language
+                            language: service.language,
+                            preset: session.capturePreset
                         )
                     ) {
                         Picker(

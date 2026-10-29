@@ -1,17 +1,26 @@
 # Experimental 10-bit RGB DPCM transport
 
-`native4_5kRaw60` (**iMac 4.5K DPCM**) targets 4480 × 2520, the
-[24-inch M1 iMac's native resolution](https://support.apple.com/en-gb/111895).
-`native5kRaw60` (**5K DPCM**) targets 5120 × 2880. Both target up to 60 FPS and request packed
-10-bit RGB (`l10r`, ARGB2101010 little endian) from ScreenCaptureKit and
-losslessly transmit the captured RGB samples using TBD2 tile-DPCM.
-This is an experimental transport, not a guarantee of sustained 4.5K60 or 5K60,
-HDR, native 10-bit source content, or 10-bit panel scanout.
+Select **4.5K** (`retina4_5k60`) as the stream profile and **DPCM RGB 10-bit
+(lossless)** under **Video compression** to capture 4480 × 2520 packed 10-bit
+RGB. This matches the [24-inch M1 iMac's native resolution](https://support.apple.com/en-gb/111895),
+but the profile is not limited to that model. DPCM can be selected with any
+stream profile; compression does not change its resolution or frame-rate limit.
+The selection is remembered for each receiver.
+
+The legacy **4.5K DPCM** (`native4_5kRaw60`) and **5K DPCM**
+(`native5kRaw60`) profiles remain available at 4480 × 2520 and 5120 × 2880,
+respectively, both targeting up to 60 FPS. With **Automatic** compression,
+these profiles retain their DPCM preference and compatibility fallback for old
+receivers. Explicit H.264 or HEVC overrides that profile default. Ordinary
+profiles with **Automatic** keep the existing hardware-codec selection.
+
+A negotiated DPCM session requests packed 10-bit RGB (`l10r`, ARGB2101010
+little endian) from ScreenCaptureKit and losslessly transmits the captured RGB
+samples using TBD2 tile-DPCM. This is an experimental transport, not a guarantee
+of sustained 4.5K60 or 5K60, HDR, native 10-bit source content, or 10-bit panel scanout.
 
 For 1:1 capture, enable render matching in Extended Desktop: the 4.5K profile
 uses a 2240 × 1260 HiDPI desktop, and the 5K profile uses 2560 × 1440.
-The separate **iMac 4.5K** (`retina4_5k60`) preset uses the existing HEVC path;
-select **iMac 4.5K DPCM** to request 10-bit RGB capture.
 
 This integration is based on the 3.6.0 `main` release. It retains the mainline
 codec preferences, native-scale 1080p profiles, receiver identity migration and
@@ -45,11 +54,13 @@ panel scanout are outside the codec's bit-exact guarantee. Capture remains SDR.
 
 | Receiver / selected mode | Capture and wire format |
 |---|---|
-| DPCM receiver also advertises `supportsDPCMAdaptiveColor` | 10-bit TBD2 with reversible per-tile colour decorrelation |
-| DPCM preset, receiver advertises a working Metal DPCM decoder | Display P3 10-bit RGB, TBD2 (`0x25`) |
-| DPCM preset, old receiver supports raw NV12 | 8-bit NV12, existing raw packet (`0x22`) |
-| DPCM preset, receiver supports neither DPCM nor raw NV12 | Existing HEVC/H.264 path, subject to encoder availability |
-| Existing preset | Existing encoded path, or explicitly enabled `RAW=1` NV12 |
+| DPCM selected, receiver advertises a working Metal DPCM decoder | Display P3 10-bit RGB, TBD2 (`0x25`) |
+| Negotiated DPCM receiver also advertises `supportsDPCMAdaptiveColor` | 10-bit TBD2 with reversible per-tile colour decorrelation |
+| Explicit DPCM, receiver lacks DPCM support | Error before capture; no silent NV12 or hardware-codec fallback |
+| Automatic + legacy DPCM profile, old receiver supports raw NV12 | 8-bit NV12, existing raw packet (`0x22`) |
+| Automatic + legacy DPCM profile, receiver supports neither DPCM nor raw NV12 | Existing HEVC/H.264 path, subject to encoder availability |
+| Automatic + ordinary profile | Existing encoded path, or explicitly enabled `RAW=1` NV12 |
+| Explicit H.264 or HEVC with any profile | Hardware-codec path; overrides the profile default and `RAW=1` |
 
 Absent capability fields mean unsupported. Selection happens before capture
 starts, so a packed RGB frame never reaches the planar NV12 sender. The active
@@ -78,7 +89,7 @@ TBD2 splits frames into independent 8 × 8 tiles. Each tile stores its first
 pixel and per-channel residual widths. Remaining pixels predict from the left,
 except the first column which predicts from above. Modular residuals and zigzag
 coding preserve samples exactly at either supported codec depth (8 or 10 bits).
-The current Sender DPCM presets accept only 10-bit capture.
+The current Sender DPCM transport accepts only 10-bit capture.
 
 When the receiver advertises `supportsDPCMAdaptiveColor`, each tile compares
 RGB coding with `(B-G, G, R-G)` modulo 1024 (256 in the 8-bit codec tests).
@@ -150,9 +161,10 @@ checks first-frame visibility, teardown, oversized-frame rejection and native
 4.5K decode readback (including its final partial group). It does
 not capture the screen or change display settings.
 
-Sender XCTest coverage checks capability combinations, the actual SCStream
-configuration, rejection of incompatible pixel buffers and CPU fallback
-round-trips of all 1024 channel values. See [Testing](Testing.md) for commands.
+Sender XCTest coverage checks explicit-choice priority, capability rejection,
+automatic compatibility fallback, saved codec preferences and idle previews. It
+also checks the actual SCStream configuration, rejection of incompatible pixel
+buffers and CPU fallback round-trips of all 1024 channel values. See [Testing](Testing.md) for commands.
 
 For a stream stuck before its first HEVC frame, the Sender logs encoder creation,
 optional-property rejection, preparation and the first encoded packet. Receiver
