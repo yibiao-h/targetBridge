@@ -501,9 +501,15 @@ enum TBDisplaySenderL10n {
 
     static func codecPreferenceHint(
         _ preference: TBDisplayCodecPreference,
-        language: TBDisplaySenderLanguage
+        language: TBDisplaySenderLanguage,
+        preset: TBDisplayCapturePreset? = nil
     ) -> String {
-        text("sender.codec.hint.\(preference.rawValue)", language)
+        if preference == .automatic, let preset {
+            if preset.isRawRGB10 {
+                return text("sender.codec.hint.automatic.rawRGB10", language)
+            }
+        }
+        return text("sender.codec.hint.\(preference.rawValue)", language)
     }
 
     static func codecUnavailable(_ language: TBDisplaySenderLanguage) -> String {
@@ -595,6 +601,10 @@ extension TBDisplayCapturePreset {
             return TBDisplaySenderL10n.text("sender.profile.crisp", language)
         case .retina4k60:
             return TBDisplaySenderL10n.text("sender.profile.retina_4k", language)
+        case .retina4_5k60:
+            return TBDisplaySenderL10n.text("sender.profile.retina_4_5k", language)
+        case .native4_5kRGB10Raw60:
+            return TBDisplaySenderL10n.text("sender.profile.native_4_5k_rgb10_raw", language)
         case .native5k:
             return TBDisplaySenderL10n.text("sender.profile.native_5k", language)
         case .native5k60Experimental:

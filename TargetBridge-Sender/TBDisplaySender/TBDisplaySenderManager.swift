@@ -260,9 +260,9 @@ final class TBDisplaySenderService: ObservableObject {
             receiverAddress: session.receiverIP.trimmingCharacters(in: .whitespacesAndNewlines),
             receiverProfileAvailable: session.receiverSupportsHEVCDecodeHint != nil,
             receiverSupportsHEVC: session.receiverSupportsHEVCDecodeHint,
-            requiresHEVC: session.codecPreference == .hevc || (
+            requiresHEVC: session.codecPreference.requestedTransport(for: session.capturePreset) == .encoded && (session.codecPreference == .hevc || (
                 session.codecPreference == .automatic && session.capturePreset.codecName == "HEVC"
-            ),
+            )),
             cableRate: session.cableTestResult,
             requiresSenderInputMonitoring: role == .senderMaster,
             senderInputMonitoringGranted: localInputMonitoringTrusted,

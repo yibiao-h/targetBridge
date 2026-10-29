@@ -201,6 +201,47 @@ struct TBDisplaySenderContentView: View {
     }
 }
 
+/// This view observes the once-per-window snapshot; no frame callback touches UI.
+private struct TBRGBDiagnosticsView: View {
+    @ObservedObject var metrics: TBSessionLiveMetrics
+    let language: TBDisplaySenderLanguage
+
+    var body: some View {
+        if let rgb = metrics.rgb {
+            VStack(alignment: .leading, spacing: 8) {
+                row("capture", "\(rgb.captureWidth) × \(rgb.captureHeight) · l10r 10-bit",
+                    namespace: "raw")
+                row("frame_mb", format(rgb.meanPacketMB))
+
+                row("submitted_gbps", format(rgb.submittedGbps))
+                row("copy_ms", format(rgb.meanEncodePacketMS))
+                row("transport", TBDisplaySenderL10n.text("sender.raw.uncompressed", language))
+                Text(TBDisplaySenderL10n.text("sender.raw.measurement_note", language))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func format(_ value: Double?) -> String {
+        value.map { String(format: "%.2f", $0) } ?? "—"
+    }
+
+    private func row(_ field: String, _ value: String, namespace: String = "raw") -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            Text(TBDisplaySenderL10n.text("sender.\(namespace).\(field)", language))
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 138, alignment: .leading)
+            Text(value)
+                .monospacedDigit()
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
 private struct TBDisplaySenderSessionCard: View {
     @ObservedObject var service: TBDisplaySenderService
     @ObservedObject var session: TBDisplaySenderSession
@@ -311,6 +352,7 @@ private struct TBDisplaySenderSessionCard: View {
                     infoRow(TBDisplaySenderL10n.virtualDisplayLabel(service.language), session.virtualDisplayText)
                     infoRow(TBDisplaySenderL10n.streamLabel(service.language), session.streamResolutionText)
                     infoRow(TBDisplaySenderL10n.fpsLabel(service.language), "\(session.senderFPS)")
+                    TBRGBDiagnosticsView(metrics: session.liveMetrics, language: service.language)
                 }
             }
         }
@@ -639,7 +681,8 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                         TBDisplaySenderL10n.videoCompression(service.language),
                         details: TBDisplaySenderL10n.codecPreferenceHint(
                             session.codecPreference,
-                            language: service.language
+                            language: service.language,
+                            preset: session.capturePreset
                         )
                     ) {
                         Picker(
