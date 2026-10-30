@@ -39,7 +39,7 @@
   "sender.label.state": "State",
   "sender.option.manual_entry": "Manual entry",
   "sender.option.not_detected": "Not detected",
-  "sender.group.stream_profile": "Stream profile",
+  "sender.group.stream_profile": "Resolution and frame rate",
   "sender.codec.label": "Video compression",
   "sender.codec.automatic": "Automatic (recommended)",
   "sender.codec.h264": "H.264",
@@ -47,9 +47,9 @@
   "sender.codec.rawRGB10": "RGB 10-bit uncompressed",
   "sender.codec.hint.automatic": "Selects HEVC or H.264 based on both Macs’ capabilities.",
   "sender.codec.hint.automatic.rawRGB10": "Keeps this profile’s uncompressed RGB 10-bit transport. Unsupported receivers show an error.",
-  "sender.codec.hint.h264": "Overrides the profile’s default compression. Prefers H.264; tries HEVC if unavailable.",
-  "sender.codec.hint.hevc": "Overrides the profile’s default compression. Prefers HEVC; tries H.264 if unavailable.",
-  "sender.codec.hint.rawRGB10": "Overrides the profile’s default compression and sends captured RGB 10-bit samples directly. Requires high bandwidth and receiver support.",
+  "sender.codec.hint.h264": "Prefers H.264; tries HEVC if unavailable.",
+  "sender.codec.hint.hevc": "Prefers HEVC; tries H.264 if unavailable.",
+  "sender.codec.hint.rawRGB10": "Sends captured RGB 10-bit samples without compression. Requires high bandwidth and receiver support.",
   "sender.codec.unavailable": "No compatible hardware video codec is available for this resolution.",
   "sender.group.display_profiles": "Display profiles",
   "sender.display_profiles.hint": "Apply a ready-to-use setup. TargetBridge remembers the last choice for this receiver.",
@@ -191,7 +191,7 @@
   "receiver.network.not_detected": "not detected",
   "receiver.panel.default": "5K display",
   "receiver.panel.unknown": "unknown display",
-  "receiver.mode.default": "2560 x 1440 HiDPI on 5K display",
+  "receiver.mode.default": "Waiting for stream configuration",
   "receiver.mode.receiving": "%{width} x %{height} px receiving",
   "receiver.mode.requested_source_preset_codec": "%{width} x %{height} px requested (%{source}, %{preset}, %{codec})",
   "receiver.mode.requested_preset_codec": "%{width} x %{height} px requested (%{preset}, %{codec})",
@@ -204,5 +204,6 @@
   "sender.input_bindings.details": "Available when Receiver is Master. Trigger is pressed on the receiver; Action runs on this Mac. The trigger cannot be a macOS-reserved shortcut, such as Ctrl+Left for Spaces: use Ctrl+Option+Left instead. The action may use reserved shortcuts, including Ctrl+Left to switch this Mac's Space.",
   "sender.input_bindings.record": "Press keys...",
   "sender.raw.frame_mb": "Average frame (MB)",
-  "sender.raw.submitted_gbps": "Video submitted (Gbps)"
+  "sender.raw.submitted_gbps": "Video submitted (Gbps)",
+  "sender.stream_profile.hint": "Choose the stream resolution and FPS here; select video compression below. Start lower on slower links."
 }

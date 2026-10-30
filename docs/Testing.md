@@ -184,3 +184,13 @@ target against complete 1024-level ramps, one-pixel checkerboards and isolated
 pixels. Render-target equality does not validate Core Animation color management,
 physical panel depth, screen capture or sustained remote frame rate. Validate the
 actual Apple Silicon and Intel receivers separately; see [RAW RGB10](Raw-RGB10.md).
+
+### Receiver stream-profile display
+
+Run `python3 TargetBridge-Receiver/TBReceiverC/tests/test_stream_mode.py` to
+exercise the production handshake, language changes, frame metadata and
+connection reset with real translations and synthetic frames. Before a sender
+provides dimensions, the status page shows a waiting message. Requested
+resolution remains visible across language changes until a valid frame arrives;
+then received pixel dimensions take priority. Disconnect clears the previous
+session's dimensions. A fixed HiDPI desktop size is never used as stream metadata.

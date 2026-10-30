@@ -64,6 +64,13 @@ struct tb_video_diagnostics {
     int param_sets_ready;
 };
 
+/* Retain values, not just translated text, across UI language updates. */
+struct tb_stream_mode {
+    int requested_w, requested_h;
+    int received_w, received_h;
+    char source[64], preset[64], codec[64];
+};
+
 struct app {
     struct tb_display *disp;
     struct tb_decoder *dec;
@@ -106,6 +113,7 @@ struct app {
     char     sender_text[128];
     char     panel_text[128];
     char     mode_text[128];
+    struct tb_stream_mode stream_mode;
     char     language_pref[8];
     char     language_text[96];
     char     permissions_text[160];
@@ -200,6 +208,7 @@ static void tb_set_receiver_mode_requested(char *dest,
                                            const char *source,
                                            const char *preset,
                                            const char *codec);
+static void tb_refresh_stream_mode(struct app *a);
 static void tb_refresh_idle_localized_strings(struct app *a);
 static void tb_receiver_load_language_preference(char *dest, size_t size);
 static void tb_receiver_save_language_preference(const char *language_pref);
@@ -444,9 +453,11 @@ static void tb_receiver_cycle_language_preference(struct app *a) {
 
 static void tb_refresh_idle_localized_strings(struct app *a) {
     if (!a) return;
-    tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.waiting_for_sender");
-    tb_copy_i18n(a->sender_text, sizeof(a->sender_text), "receiver.status.waiting");
-    tb_copy_i18n(a->mode_text, sizeof(a->mode_text), "receiver.mode.default");
+    if (!a->session_active && !a->have_video_frame) {
+        tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.waiting_for_sender");
+        tb_copy_i18n(a->sender_text, sizeof(a->sender_text), "receiver.status.waiting");
+    }
+    tb_refresh_stream_mode(a);
     tb_receiver_refresh_permissions_text(a);
     if (a->ip_text[0] == '\0') {
         tb_copy_i18n(a->ip_text, sizeof(a->ip_text), "receiver.network.not_detected");
@@ -578,6 +589,40 @@ static void tb_set_receiver_mode_requested(char *dest,
     } else if (width > 0 && height > 0) {
         tb_format_i18n(dest, size, "receiver.mode.requested", pairs, 5);
     }
+}
+
+static void tb_refresh_stream_mode(struct app *a) {
+    if (!a) return;
+    const struct tb_stream_mode *mode = &a->stream_mode;
+    if (mode->received_w > 0 && mode->received_h > 0) {
+        char width_text[16], height_text[16];
+        snprintf(width_text, sizeof(width_text), "%d", mode->received_w);
+        snprintf(height_text, sizeof(height_text), "%d", mode->received_h);
+        const struct tb_i18n_pair pairs[] = {
+            { "width", width_text }, { "height", height_text }
+        };
+        tb_format_i18n(a->mode_text, sizeof(a->mode_text), "receiver.mode.receiving", pairs, 2);
+    } else {
+        /* A legacy HELLO may omit dimensions. Never display a panel-specific
+         * guess or metadata retained from a previous connection. */
+        tb_copy_i18n(a->mode_text, sizeof(a->mode_text), "receiver.mode.default");
+        tb_set_receiver_mode_requested(a->mode_text, sizeof(a->mode_text),
+                                       mode->requested_w, mode->requested_h,
+                                       mode->source, mode->preset, mode->codec);
+    }
+}
+
+static void tb_record_stream_dimensions(struct app *a, int width, int height) {
+    if (width <= 0 || height <= 0 ||
+        (a->stream_mode.received_w == width && a->stream_mode.received_h == height)) return;
+    a->stream_mode.received_w = width;
+    a->stream_mode.received_h = height;
+    tb_refresh_stream_mode(a);
+}
+
+static void tb_reset_stream_mode(struct app *a) {
+    memset(&a->stream_mode, 0, sizeof(a->stream_mode));
+    tb_refresh_stream_mode(a);
 }
 
 static void bonjour_deinit(struct app *a) {
@@ -1015,17 +1060,7 @@ static void on_frame(const uint8_t *y, int y_stride,
     tb_video_diagnostics_decoded(a, w, h, y_stride, uv_stride);
     a->have_video_frame = 1;
     tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
-    {
-        char width_text[16];
-        char height_text[16];
-        struct tb_i18n_pair pairs[] = {
-            { "width", width_text },
-            { "height", height_text }
-        };
-        snprintf(width_text, sizeof(width_text), "%d", w);
-        snprintf(height_text, sizeof(height_text), "%d", h);
-        tb_format_i18n(a->mode_text, sizeof(a->mode_text), "receiver.mode.receiving", pairs, 2);
-    }
+    tb_record_stream_dimensions(a, (int)w, (int)h);
     tb_disp_render_nv12(a->disp, y, y_stride, uv, uv_stride, w, h);
     a->frames++;
 }
@@ -1065,17 +1100,7 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
 
     a->have_video_frame = 1;
     tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
-    {
-        char width_text[16];
-        char height_text[16];
-        struct tb_i18n_pair pairs[] = {
-            { "width", width_text },
-            { "height", height_text }
-        };
-        snprintf(width_text, sizeof(width_text), "%u", w);
-        snprintf(height_text, sizeof(height_text), "%u", h);
-        tb_format_i18n(a->mode_text, sizeof(a->mode_text), "receiver.mode.receiving", pairs, 2);
-    }
+    tb_record_stream_dimensions(a, (int)w, (int)h);
     if (!packed_rgb10)
         tb_disp_render_nv12(a->disp, y, (int)ys, uv, (int)us, (int)w, (int)h);
     a->frames++;
@@ -1225,6 +1250,7 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
                 if (strcmp(a->language_pref, "auto") == 0) {
                     tb_i18n_set_runtime_language(ui_language);
                 }
+                tb_refresh_stream_mode(a);
                 if (a->client_fd < 0 || !a->have_video_frame) {
                     tb_refresh_idle_localized_strings(a);
                 }
@@ -1248,21 +1274,14 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
             tb_copy_i18n(a->sender_text, sizeof(a->sender_text), "receiver.status.sender_connected");
         }
         {
-            char preset[64];
-            char source[64];
-            char codec[64];
-            int capture_w = 0;
-            int capture_h = 0;
-            preset[0] = '\0';
-            source[0] = '\0';
-            codec[0] = '\0';
-            extract_json_string_field(payload, len, "\"capturePreset\"", preset, sizeof(preset));
-            extract_json_string_field(payload, len, "\"captureSource\"", source, sizeof(source));
-            extract_json_string_field(payload, len, "\"codec\"", codec, sizeof(codec));
-            (void)extract_json_int_field(payload, len, "\"captureWidth\"", &capture_w);
-            (void)extract_json_int_field(payload, len, "\"captureHeight\"", &capture_h);
-
-            tb_set_receiver_mode_requested(a->mode_text, sizeof(a->mode_text), capture_w, capture_h, source, preset, codec);
+            struct tb_stream_mode *mode = &a->stream_mode;
+            mode->requested_w = mode->requested_h = 0;
+            extract_json_string_field(payload, len, "\"capturePreset\"", mode->preset, sizeof(mode->preset));
+            extract_json_string_field(payload, len, "\"captureSource\"", mode->source, sizeof(mode->source));
+            extract_json_string_field(payload, len, "\"codec\"", mode->codec, sizeof(mode->codec));
+            (void)extract_json_int_field(payload, len, "\"captureWidth\"", &mode->requested_w);
+            (void)extract_json_int_field(payload, len, "\"captureHeight\"", &mode->requested_h);
+            tb_refresh_stream_mode(a);
         }
         a->session_active = 1;
         fprintf(stderr, "[main] hello from sender\n");
@@ -2035,6 +2054,7 @@ static void close_client(struct app *a) {
     a->session_active = 0;
     a->close_requested = 0;
     a->have_video_frame = 0;
+    tb_reset_stream_mode(a);
     snprintf(a->input_control_mode, sizeof(a->input_control_mode), "off");
     SDL_EnableScreenSaver();
     tb_receiver_refresh_input_capture(a);
@@ -2266,6 +2286,7 @@ int main(int argc, char **argv) {
                 tb_video_diagnostics_reset(&a);
                 a.have_video_frame = 0;
                 a.session_active = 0;
+                tb_reset_stream_mode(&a);
                 a.reported_night_shift = -1;   /* force one report per session */
                 a.reported_true_tone = -1;
                 a.last_recv_ms = t;

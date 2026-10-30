@@ -329,6 +329,16 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
+    /// Legacy combined presets remain decodable and usable by CLI aliases.
+    /// The menu exposes each resolution/frame-rate pair only once.
+    static var resolutionPresets: [Self] { allCases.filter { $0.canonical == $0 } }
+
+    var canonical: Self {
+        self == .native4_5kRGB10Raw60 ? .retina4_5k60 : self
+    }
+
+    var resolutionTitle: String { "\(width) × \(height) · \(expectedFrameRate) FPS" }
+
     var title: String {
         switch self {
         case .standard1080p:
@@ -1162,6 +1172,10 @@ enum TBDisplayCodecPreference: String, CaseIterable, Identifiable, Codable {
     case rawRGB10
 
     var id: String { rawValue }
+
+    func normalized(for preset: TBDisplayCapturePreset) -> Self {
+        self == .automatic && preset.isRawRGB10 ? .rawRGB10 : self
+    }
 
     func requestedTransport(for preset: TBDisplayCapturePreset) -> TBVideoTransport {
         switch self {
@@ -2213,6 +2227,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
     @Published var capturePreset: TBDisplayCapturePreset = .standard1440p {
         didSet {
+            // Resolve the CLI/legacy preset's transport intent before removing
+            // its old combined tag. Explicit compression always takes priority.
+            let preference = codecPreference.normalized(for: capturePreset)
+            // @Published re-enters didSet on assignment, even for equal values.
+            if capturePreset != capturePreset.canonical {
+                capturePreset = capturePreset.canonical
+            }
+            if preference != codecPreference { codecPreference = preference }
             if !isStreaming {
                 refreshConfiguredStreamSummary()
             }
@@ -2225,6 +2247,24 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             }
         }
     }
+    /// Receiver defaults initialize a newly selected receiver; a Bonjour address
+    /// or identity refresh must not replace this session's saved compression.
+    @discardableResult
+    func updateDiscoveredReceiver(_ receiver: TBDiscoveredReceiver,
+                                  defaultCodecPreference: TBDisplayCodecPreference? = nil) -> Bool {
+        let sameReceiver = receiver.matchesPersistedIdentity(selectedReceiverID)
+        selectedReceiverID = receiver.stableIdentity
+        receiverIP = receiver.ip(for: transportKind)
+        receiverSupportsHEVCDecodeHint = receiver.supportsHEVCDecode
+        if !sameReceiver { codecPreference = defaultCodecPreference ?? .automatic }
+        return !sameReceiver
+    }
+
+    func inheritStreamSelection(from previous: TBDisplaySenderSession) {
+        codecPreference = previous.codecPreference
+        capturePreset = previous.capturePreset
+    }
+
     @Published var captureSource: TBDisplayCaptureSource = .desktopMirror {
         didSet {
             if !isStreaming {

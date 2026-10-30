@@ -492,6 +492,10 @@ enum TBDisplaySenderL10n {
         text("sender.codec.label", language)
     }
 
+    static func streamProfileHint(_ language: TBDisplaySenderLanguage) -> String {
+        text("sender.stream_profile.hint", language)
+    }
+
     static func codecPreferenceTitle(
         _ preference: TBDisplayCodecPreference,
         language: TBDisplaySenderLanguage

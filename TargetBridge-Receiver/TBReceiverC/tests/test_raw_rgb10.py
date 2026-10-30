@@ -25,7 +25,8 @@ def function(name):
     return source[start:pos]
 
 
-fixture = r'''
+mode_struct = re.search(r"struct tb_stream_mode \{.*?\n\};", source, re.S).group(0)
+fixture = mode_struct + r'''
 #include "display.h"
 #include "receiver_profile.h"
 #include "net.h"
@@ -35,7 +36,7 @@ fixture = r'''
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-struct app { struct tb_display *disp; int client_fd, have_video_frame; uint64_t frames; char status_text[128],mode_text[128]; };
+struct app { struct tb_display *disp; int client_fd, have_video_frame; uint64_t frames; struct tb_stream_mode stream_mode; char status_text[128],mode_text[128]; };
 struct tb_i18n_pair { const char *key, *value; };
 static int packed_calls,nv12_calls,render_rc,packed_support;
 static int last_width,last_height,last_stride;
@@ -114,7 +115,7 @@ int main(void){
 '''
 with tempfile.TemporaryDirectory(prefix="tb-raw-rgb10-") as directory:
     path = Path(directory) / "test.c"
-    path.write_text(fixture + function("handle_raw_frame") + function("write_be32") + function("send_receiver_info") + checks)
+    path.write_text(fixture + function("tb_set_receiver_mode_requested") + function("tb_refresh_stream_mode") + function("tb_record_stream_dimensions") + function("handle_raw_frame") + function("write_be32") + function("send_receiver_info") + checks)
     command = [*shlex.split(os.environ.get("CC", "cc")), "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function",
                "-I" + str(root / "src"), str(path), str(root / "src/net.c"), str(root / "src/receiver_profile.c"), "-o", str(path.with_suffix(""))]
     if sys.platform == "darwin":

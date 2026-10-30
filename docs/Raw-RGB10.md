@@ -1,9 +1,12 @@
 # Uncompressed RGB10 streaming
 
-Choose the ordinary **4.5K** resolution preset, then **RGB10 uncompressed** in
-**Video Compression**. Resolution and compression are independent: choosing
+Choose **4480 × 2520 · 60 FPS** under **Resolution and frame rate**, then
+**RGB10 uncompressed** under **Video compression**. Resolution and compression are independent: choosing
 H.264 or HEVC explicitly uses the encoded path even for the older RAW preset.
-Automatic retains compatibility with the saved `native4_5kRGB10Raw60` preset.
+Saved Automatic + `native4_5kRGB10Raw60` settings migrate to the ordinary 4.5K
+resolution with explicit RGB10 compression. The old preset remains a CLI alias
+but is hidden from the resolution menu. Changing only the resolution or
+refreshing receiver discovery preserves each session's compression choice.
 An explicit RGB10 selection requires the Receiver's `supportsRawRGB10` capability;
 a missing capability produces an error rather than silently selecting NV12.
 

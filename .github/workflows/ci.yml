@@ -87,6 +87,7 @@ jobs:
           python3 TargetBridge-Receiver/TBReceiverC/tests/test_raw_rgb10.py
           python3 TargetBridge-Receiver/TBReceiverC/tests/test_socket_drain.py
           python3 TargetBridge-Receiver/TBReceiverC/tests/test_video_diagnostics.py
+          python3 TargetBridge-Receiver/TBReceiverC/tests/test_stream_mode.py
 
       - name: Build Receiver App
         run: |

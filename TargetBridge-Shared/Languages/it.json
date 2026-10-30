@@ -39,7 +39,7 @@
   "sender.label.state": "State",
   "sender.option.manual_entry": "Inserimento manuale",
   "sender.option.not_detected": "Non rilevato",
-  "sender.group.stream_profile": "Profilo stream",
+  "sender.group.stream_profile": "Risoluzione e frequenza fotogrammi",
   "sender.codec.label": "Compressione video",
   "sender.codec.automatic": "Automatica (consigliata)",
   "sender.codec.h264": "H.264",
@@ -47,9 +47,9 @@
   "sender.codec.rawRGB10": "RGB 10 bit non compresso",
   "sender.codec.hint.automatic": "Sceglie HEVC o H.264 in base alle capacità dei due Mac.",
   "sender.codec.hint.automatic.rawRGB10": "Mantiene il trasporto RGB 10 bit non compresso di questo profilo. Mostra un errore se il ricevitore non lo supporta.",
-  "sender.codec.hint.h264": "Sostituisce la compressione predefinita del profilo. Preferisce H.264; prova HEVC se non disponibile.",
-  "sender.codec.hint.hevc": "Sostituisce la compressione predefinita del profilo. Preferisce HEVC; prova H.264 se non disponibile.",
-  "sender.codec.hint.rawRGB10": "Sostituisce la compressione predefinita e invia direttamente i campioni RGB a 10 bit acquisiti. Richiede banda elevata e un ricevitore compatibile.",
+  "sender.codec.hint.h264": "Preferisce H.264; prova HEVC se non disponibile.",
+  "sender.codec.hint.hevc": "Preferisce HEVC; prova H.264 se non disponibile.",
+  "sender.codec.hint.rawRGB10": "Invia i campioni RGB a 10 bit acquisiti senza compressione. Richiede banda elevata e supporto del receiver.",
   "sender.codec.unavailable": "Nessun formato video hardware compatibile è disponibile per questa risoluzione.",
   "sender.group.display_profiles": "Profili display",
   "sender.display_profiles.hint": "Applica una configurazione pronta. TargetBridge ricorda l'ultima scelta per questo receiver.",
@@ -191,7 +191,7 @@
   "receiver.network.not_detected": "non rilevato",
   "receiver.panel.default": "display 5K",
   "receiver.panel.unknown": "display sconosciuto",
-  "receiver.mode.default": "2560 x 1440 HiDPI su display 5K",
+  "receiver.mode.default": "In attesa della configurazione del flusso",
   "receiver.mode.receiving": "%{width} x %{height} px in ricezione",
   "receiver.mode.requested_source_preset_codec": "%{width} x %{height} px richiesti (%{source}, %{preset}, %{codec})",
   "receiver.mode.requested_preset_codec": "%{width} x %{height} px richiesti (%{preset}, %{codec})",
@@ -204,5 +204,6 @@
   "sender.input_bindings.details": "Disponibile quando Receiver e Master. Il trigger viene premuto sul receiver; l'azione viene eseguita su questo Mac. Il trigger non puo essere una scorciatoia riservata da macOS, come Ctrl+Freccia Sinistra per gli Spazi: usa invece Ctrl+Option+Freccia Sinistra. L'azione puo usare anche scorciatoie riservate, incluso Ctrl+Freccia Sinistra per cambiare Spazio su questo Mac.",
   "sender.input_bindings.record": "Premi i tasti...",
   "sender.raw.frame_mb": "Fotogramma medio (MB)",
-  "sender.raw.submitted_gbps": "Video inviato (Gbps)"
+  "sender.raw.submitted_gbps": "Video inviato (Gbps)",
+  "sender.stream_profile.hint": "Scegli qui risoluzione e FPS; seleziona la compressione video sotto. Inizia con valori più bassi sui collegamenti lenti."
 }

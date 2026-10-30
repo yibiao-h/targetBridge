@@ -39,7 +39,7 @@
   "sender.label.state": "状态",
   "sender.option.manual_entry": "手动输入",
   "sender.option.not_detected": "未检测到",
-  "sender.group.stream_profile": "码流配置",
+  "sender.group.stream_profile": "分辨率与帧率",
   "sender.codec.label": "视频压缩",
   "sender.codec.automatic": "自动（推荐）",
   "sender.codec.h264": "H.264",
@@ -47,9 +47,9 @@
   "sender.codec.rawRGB10": "RGB 10-bit 无压缩",
   "sender.codec.hint.automatic": "根据两端能力选择 HEVC 或 H.264。",
   "sender.codec.hint.automatic.rawRGB10": "保留此配置的 RGB 10-bit 无压缩传输；接收端不支持时会报错。",
-  "sender.codec.hint.h264": "覆盖配置默认压缩，优先使用 H.264；不可用时尝试 HEVC。",
-  "sender.codec.hint.hevc": "覆盖配置默认压缩，优先使用 HEVC；不可用时尝试 H.264。",
-  "sender.codec.hint.rawRGB10": "覆盖配置默认压缩，直接传输 RGB 10-bit 捕获样本；需要高带宽及接收端支持。",
+  "sender.codec.hint.h264": "优先使用 H.264；不可用时尝试 HEVC。",
+  "sender.codec.hint.hevc": "优先使用 HEVC；不可用时尝试 H.264。",
+  "sender.codec.hint.rawRGB10": "不压缩，直接发送采集到的 RGB 10-bit 样本。需要较高带宽和接收端支持。",
   "sender.codec.unavailable": "此分辨率没有可用的兼容硬件视频编码。",
   "sender.group.display_profiles": "显示配置",
   "sender.display_profiles.hint": "一键应用预设。TargetBridge 会记住此 receiver 的上次选择。",
@@ -191,7 +191,7 @@
   "receiver.network.not_detected": "未检测到",
   "receiver.panel.default": "5K 显示器",
   "receiver.panel.unknown": "未知显示器",
-  "receiver.mode.default": "2560 x 1440 HiDPI（5K 显示器）",
+  "receiver.mode.default": "等待码流配置",
   "receiver.mode.receiving": "正在接收 %{width} x %{height} px",
   "receiver.mode.requested_source_preset_codec": "请求 %{width} x %{height} px（%{source}，%{preset}，%{codec}）",
   "receiver.mode.requested_preset_codec": "请求 %{width} x %{height} px（%{preset}，%{codec}）",
@@ -204,5 +204,6 @@
   "sender.input_bindings.details": "仅在“Receiver 是 Master”时可用。触发组合键在 receiver 上按下；操作在这台 Mac 上执行。触发组合键不能是 macOS 保留快捷键，例如用于切换空间的 Ctrl+左箭头：请改用 Ctrl+Option+左箭头。操作可以使用保留快捷键，包括使用 Ctrl+左箭头切换这台 Mac 的空间。",
   "sender.input_bindings.record": "请按快捷键...",
   "sender.raw.frame_mb": "平均每帧（MB）",
-  "sender.raw.submitted_gbps": "视频提交速率（Gbps）"
+  "sender.raw.submitted_gbps": "视频提交速率（Gbps）",
+  "sender.stream_profile.hint": "在此选择串流分辨率和 FPS，在下一项选择视频压缩。较慢链路建议从较低配置开始。"
 }
